@@ -107,7 +107,7 @@ def _ai_inputs_hash(location, occupancy, seated, capacity, weather, patio, overs
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-def _call_cortex_ai(location_name, occupancy_pct, seated_count, total_capacity, weather_desc, patio_status, overstay_summary, upcoming_bookings):
+def _call_cortex_ai(location_name, occupancy_pct, seated_count, total_capacity, weather_desc, patio_status, overstay_summary, upcoming_bookings, per_location_summary=None):
     focus_pools = [
         "table turnover efficiency, seating optimization, and kitchen timing",
         "guest experience quality, VIP handling, and floor flow bottlenecks",
@@ -117,7 +117,45 @@ def _call_cortex_ai(location_name, occupancy_pct, seated_count, total_capacity, 
     ]
     focus = random.choice(focus_pools)
 
-    prompt = f"""You are a sharp restaurant operations analyst for Osteria Bella, an upscale Italian restaurant.
+    is_all_locations = (location_name == "All Locations")
+
+    if is_all_locations and per_location_summary:
+        prompt = f"""You are a sharp multi-unit restaurant operations analyst for Osteria Bella (5 locations).
+Analyze this cross-location snapshot and return 2-3 actionable insights as JSON.
+
+AGGREGATE DATA:
+- Total Occupancy: {occupancy_pct:.1f}% ({seated_count} seated / {total_capacity} capacity)
+- Total Waitlist / Bookings: {upcoming_bookings} parties waiting
+- Weather: {weather_desc} ({patio_status})
+
+PER-LOCATION BREAKDOWN:
+{per_location_summary}
+
+ANALYSIS FOCUS: {focus}
+
+RULES:
+1. Compare locations — call out which location needs attention and which is running well.
+2. Name the specific location in every suggestion. Do NOT reference individual table numbers.
+3. Back every suggestion with specific numbers from the data above.
+4. Each suggestion must cover a DIFFERENT operational concern.
+5. Vary severity levels — use OK and INFO when locations are running well.
+6. Focus on: rebalancing staff between locations, capacity bottlenecks, patio strategy across sites, which location to prioritize.
+7. NEVER suggest: rushing guests, comping items, discounts, or serving alcohol.
+8. Use ONLY facts present in the data. Do not invent information.
+
+Return ONLY valid JSON array (no markdown, no commentary):
+[
+  {{
+    "title": "Short punchy title (3-6 words)",
+    "severity": "CRITICAL" or "WARNING" or "INFO" or "OK",
+    "location": "Specific location name",
+    "table_ref": "N/A",
+    "facts": "Key data points supporting this action",
+    "action": "One specific next step for the operations manager"
+  }}
+]"""
+    else:
+        prompt = f"""You are a sharp restaurant operations analyst for Osteria Bella, an upscale Italian restaurant.
 Analyze this live floor snapshot and return 2-3 actionable insights as JSON.
 
 LIVE DATA:
@@ -163,7 +201,7 @@ Return ONLY valid JSON array (no markdown, no commentary):
         return None
 
 
-def get_ai_suggestions(location, occupancy, seated, capacity, weather, patio, overstay, bookings, force=False):
+def get_ai_suggestions(location, occupancy, seated, capacity, weather, patio, overstay, bookings, force=False, per_location_summary=None):
     current_hash = _ai_inputs_hash(location, occupancy, seated, capacity, weather, patio, overstay, bookings)
     cache = st.session_state.get("_ai_cache", None)
     now_ts = time.time()
@@ -172,7 +210,7 @@ def get_ai_suggestions(location, occupancy, seated, capacity, weather, patio, ov
         if cache["inputs_hash"] == current_hash:
             return cache["directives"], cache["analyzed_at"]
 
-    directives = _call_cortex_ai(location, occupancy, seated, capacity, weather, patio, overstay, bookings)
+    directives = _call_cortex_ai(location, occupancy, seated, capacity, weather, patio, overstay, bookings, per_location_summary=per_location_summary)
     analyzed_at = _get_pacific_time_str()
     st.session_state["_ai_cache"] = {
         "directives": directives,
@@ -308,10 +346,28 @@ def _render_ai_section_inner(location_filter):
 
     force_reanalyze = st.session_state.pop("_ai_force_reanalyze", False)
 
+    # Build per-location summary for all-locations view
+    per_loc_summary = None
+    if location_filter == "All Locations" and not cap_df.empty:
+        loc_lines = []
+        for _, r in cap_df.iterrows():
+            loc_occ = round(float(r["CURRENT_GUESTS_SEATED"]) / float(r["MAX_SEATS"]) * 100, 1) if float(r["MAX_SEATS"]) > 0 else 0
+            loc_lines.append(
+                f"  - {r['LOCATION_NAME']}: {loc_occ:.0f}% occupancy ({int(r['CURRENT_GUESTS_SEATED'])}/{int(r['MAX_SEATS'])} seats), "
+                f"{int(r['WAITLIST_COUNT'])} waitlist, {int(r['UPCOMING_RESERVATIONS'])} upcoming, "
+                f"${float(r['LIVE_FLOOR_REVENUE']):,.0f} open checks"
+            )
+        # Add weather per location
+        if not weather_df.empty:
+            for _, w in weather_df.iterrows():
+                patio_str = "patio open" if w["PATIO_OPEN"] else "patio closed"
+                loc_lines.append(f"  - {w['LOCATION_NAME']} weather: {w['TEMPERATURE_F']}°F {w['CONDITION']}, {patio_str}")
+        per_loc_summary = "\n".join(loc_lines)
+
     ai_directives, analyzed_at = get_ai_suggestions(
         location_filter, avg_occupancy, seated_guests, total_seats,
         weather_text, patio_status, overstay_summary, upcoming_res,
-        force=force_reanalyze
+        force=force_reanalyze, per_location_summary=per_loc_summary
     )
 
     with st.container(border=True):
@@ -378,16 +434,6 @@ def _render_ai_section_inner(location_filter):
                 st.metric("2-Top", f"{wait_2top} min" if wait_2top > 0 else "Immediate", border=True)
                 st.metric("4-Top", f"{wait_4top} min" if wait_4top > 0 else "Immediate", border=True)
                 st.metric("6+ Party", f"{wait_6top} min", border=True)
-
-            st.space("small")
-            st.markdown("**Quick Actions**")
-            col_b1, col_b2 = st.columns(2)
-            with col_b1:
-                if st.button("Flag for Manager", use_container_width=True, icon=":material/flag:"):
-                    st.toast("Manager review flagged for current floor state.", icon=":material/check:")
-            with col_b2:
-                if st.button("Hold Bar Seating", use_container_width=True, icon=":material/lock:"):
-                    st.toast("Host stand updated: Bar counter restricted to waitlist guests.", icon=":material/check:")
 
             # --- Demo Scenario ---
             st.space("small")
