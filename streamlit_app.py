@@ -155,10 +155,7 @@ def get_ai_suggestions(location, occupancy, seated, capacity, weather, patio, ov
     now_ts = time.time()
 
     if not force and cache is not None:
-        elapsed = now_ts - cache["timestamp"]
         if cache["inputs_hash"] == current_hash:
-            return cache["directives"], cache["analyzed_at"]
-        if elapsed < AI_MIN_INTERVAL_SECS:
             return cache["directives"], cache["analyzed_at"]
 
     directives = _call_cortex_ai(location, occupancy, seated, capacity, weather, patio, overstay, bookings)
