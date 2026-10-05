@@ -236,7 +236,6 @@ def render_ai_section(location_filter):
         ai_header_col, ai_action_col = st.columns([3, 2], vertical_alignment="bottom")
         with ai_header_col:
             st.subheader("🤖 Operator Directives & Action Items")
-            st.success(f"**Cortex AI (llama3.1-70b)** · Last analyzed: {datetime.now(PACIFIC_TZ).strftime('%I:%M:%S %p PT')}", icon=":material/smart_toy:")
         with ai_action_col:
             if st.button("Re-Analyze Now", icon=":material/smart_toy:", use_container_width=True):
                 generate_ai_operational_directives.clear()
@@ -248,6 +247,13 @@ def render_ai_section(location_filter):
             ai_directives = generate_ai_operational_directives(
                 location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
             )
+
+            # Store the evaluation time when a fresh AI call actually runs
+            if ai_directives is not None:
+                st.session_state["ai_last_eval"] = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
+
+            last_eval = st.session_state.get("ai_last_eval", "Pending...")
+            st.success(f"**Cortex AI (llama3.1-70b)** · Last analyzed: {last_eval} · Auto-refreshes ~45s", icon=":material/smart_toy:")
 
             if ai_directives is None:
                 st.caption("Cortex AI returned no results. Retrying on next refresh cycle.")
