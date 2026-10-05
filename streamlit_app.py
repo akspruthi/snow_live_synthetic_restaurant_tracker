@@ -113,9 +113,10 @@ Return ONLY valid JSON (no markdown ticks, no commentary) formatted as:
         if raw_text.startswith("```json"): raw_text = raw_text[7:]
         if raw_text.startswith("```"): raw_text = raw_text[3:]
         if raw_text.endswith("```"): raw_text = raw_text[:-3]
-        return json.loads(raw_text.strip())
+        analyzed_at = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
+        return json.loads(raw_text.strip()), analyzed_at
     except Exception as e:
-        return None
+        return None, datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
 
 # ----------------- Section 1: Executive KPI Row & Live Floor Telemetry -----------------
 def render_kpi_row(location_filter):
@@ -240,12 +241,11 @@ def render_ai_section(location_filter):
         col_actions, col_quick = st.columns([3, 2])
 
         with col_actions:
-            ai_directives = generate_ai_operational_directives(
+            ai_directives, analyzed_at = generate_ai_operational_directives(
                 location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
             )
 
-            last_eval = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
-            st.success(f"**Cortex AI (llama3.1-70b)** · Last analyzed: {last_eval} · Refreshes every 30s", icon=":material/smart_toy:")
+            st.success(f"**Cortex AI (llama3.1-70b)** · Last analyzed: {analyzed_at} · Refreshes every 30s", icon=":material/smart_toy:")
 
             if ai_directives is None:
                 st.caption("Cortex AI returned no results. Retrying on next refresh cycle.")
