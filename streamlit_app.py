@@ -573,12 +573,10 @@ st.space("medium")
 # 4. Floor Capacity & Seating Live Streams
 render_capacity_and_stream(selected_location)
 
-# 5. Synchronized auto-refresh: single 30s rerun cycle for the entire dashboard
-if "last_rerun" not in st.session_state:
-    st.session_state["last_rerun"] = time.time()
-
-elapsed = time.time() - st.session_state["last_rerun"]
-if elapsed >= 30:
-    st.session_state["last_rerun"] = time.time()
+# 5. Single auto-refresh: one fragment reruns the entire page every 30s
+@st.fragment(run_every="30s")
+def _sync_refresh():
     st.cache_data.clear()
     st.rerun()
+
+_sync_refresh()
