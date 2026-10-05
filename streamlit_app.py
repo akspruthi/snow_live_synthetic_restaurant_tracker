@@ -545,9 +545,10 @@ def render_daily_digest(location_filter):
     with st.container(border=True):
         hdr_col, badge_col = st.columns([3, 1], vertical_alignment="bottom")
         with hdr_col:
-            st.subheader("Daily Digest")
+            st.subheader("Operations Briefing")
         with badge_col:
-            st.caption("Powered by Cortex AI")
+            briefing_time = _get_pacific_time_str()
+            st.caption(f"Powered by Cortex AI · {briefing_time}")
 
         loc_where = ""
         loc_params = []
@@ -582,55 +583,90 @@ def render_daily_digest(location_filter):
         yoy_pct = round(((total_sales - total_py) / total_py * 100), 1) if total_py > 0 else 0.0
         avg_check = round(total_sales / total_checks, 2) if total_checks > 0 else 0
 
-        # Get live floor pressure for single-location narrative
+        # Get live floor metrics for the narrative
         cap_where = ""
         cap_params = []
         if location_filter != "All Locations":
             cap_where = "WHERE LOCATION_NAME = ?"
             cap_params.append(location_filter)
         floor_df = conn.query(f"""
-            SELECT COALESCE(SUM(WAITLIST_COUNT),0) AS WL, COALESCE(SUM(UPCOMING_RESERVATIONS),0) AS UPCOMING
+            SELECT
+                COALESCE(SUM(WAITLIST_COUNT),0) AS WL,
+                COALESCE(SUM(UPCOMING_RESERVATIONS),0) AS UPCOMING,
+                COALESCE(SUM(CURRENT_GUESTS_SEATED),0) AS SEATED,
+                COALESCE(SUM(MAX_SEATS),0) AS CAPACITY,
+                ROUND(COALESCE(SUM(CURRENT_GUESTS_SEATED),0) / NULLIF(SUM(MAX_SEATS),0) * 100, 1) AS OCC_PCT
             FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY {cap_where}
         """, params=cap_params if cap_params else None, ttl=5)
         waitlist_now = int(floor_df["WL"].iloc[0]) if not floor_df.empty else 0
         upcoming_now = int(floor_df["UPCOMING"].iloc[0]) if not floor_df.empty else 0
+        seated_now = int(floor_df["SEATED"].iloc[0]) if not floor_df.empty else 0
+        capacity_now = int(floor_df["CAPACITY"].iloc[0]) if not floor_df.empty else 0
+        occ_pct = float(floor_df["OCC_PCT"].iloc[0]) if not floor_df.empty and floor_df["OCC_PCT"].iloc[0] is not None else 0.0
+
+        # Get turn time and long-seated table info
+        res_where2 = ""
+        res_params2 = []
+        if location_filter != "All Locations":
+            res_where2 = "WHERE LOCATION_NAME = ?"
+            res_params2.append(location_filter)
+        turn_df = conn.query(f"""
+            SELECT
+                AVG(CASE WHEN STATUS = 'SEATED' THEN EST_DURATION_MINS END) AS AVG_TURN,
+                COUNT(CASE WHEN STATUS = 'SEATED' AND EST_DURATION_MINS >= 85 THEN 1 END) AS LONG_SEATED,
+                COUNT(CASE WHEN STATUS = 'SEATED' THEN 1 END) AS TOTAL_SEATED
+            FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS {res_where2}
+        """, params=res_params2 if res_params2 else None, ttl=5)
+        avg_turn = int(turn_df["AVG_TURN"].iloc[0]) if not turn_df.empty and turn_df["AVG_TURN"].iloc[0] is not None else 65
+        long_seated = int(turn_df["LONG_SEATED"].iloc[0]) if not turn_df.empty else 0
+        total_seated_tables = int(turn_df["TOTAL_SEATED"].iloc[0]) if not turn_df.empty else 0
 
         # AI narrative digest
         digest_cache = st.session_state.get("_digest_cache", None)
-        digest_key = f"{location_filter}|{total_sales:.0f}|{total_covers}|{total_checks}"
+        digest_key = f"{location_filter}|{total_sales:.0f}|{total_covers}|{total_checks}|{seated_now}|{waitlist_now}"
 
         if digest_cache and digest_cache.get("key") == digest_key:
             narrative = digest_cache["narrative"]
         else:
             is_single_loc = location_filter != "All Locations"
 
+            floor_block = f"""LIVE FLOOR STATUS:
+- Occupancy: {occ_pct:.1f}% ({seated_now} seated / {capacity_now} capacity)
+- Active tables: {total_seated_tables}
+- Avg est. turn time: {avg_turn} min (target: 65 min)
+- Tables seated 85+ min: {long_seated}
+- Waitlist: {waitlist_now} parties, Upcoming: {upcoming_now} reservations"""
+
             if is_single_loc:
                 digest_prompt = f"""Write a 2-3 sentence operations digest for {location_filter} today.
-Focus on check volume, average spend, covers served, and current floor pressure.
+Lead with the most important issue — flag any red flags first (high occupancy, long turn times, waitlist pressure, low sales pace). Then note what's going well.
 
-TODAY'S DATA FOR {location_filter}:
-- Completed sales: ${total_sales:,.2f} ({yoy_pct:+.1f}% vs prior year)
-- Covers served: {total_covers} across {total_checks} closed checks
-- Average check: ${avg_check:,.2f}
-- Current waitlist: {waitlist_now} parties waiting, {upcoming_now} upcoming reservations
+TODAY'S COMPLETED SALES FOR {location_filter}:
+- Sales: ${total_sales:,.2f} ({yoy_pct:+.1f}% vs prior year)
+- Covers: {total_covers} across {total_checks} closed checks
+- Avg check: ${avg_check:,.2f}
 
-Write in a confident, concise tone about this single location's performance. No bullet points — just flowing prose. Do not compare to other locations. Do not invent data."""
+{floor_block}
+
+RULES: Lead with problems if any exist. Flag turn times over 65 min, occupancy over 80%, or waitlist above 5 as concerns. Be specific with numbers. No bullet points — flowing prose only. Do not invent data."""
             else:
                 loc_lines = "\n".join([
                     f"  - {r['LOCATION_NAME']}: ${float(r['TODAY_SALES']):,.0f} sales, {int(r['TODAY_COVERS'])} covers, {int(r['COMPLETED_CHECKS'])} checks"
                     for _, r in digest_df.iterrows()
                 ])
                 digest_prompt = f"""Write a 2-3 sentence executive digest for today's restaurant operations across all locations.
-Mention the top performer and any notable patterns between locations.
+Lead with the most important issue — flag red flags first (capacity pressure, long turns, waitlist buildup). Then note top performers.
 
-TODAY'S DATA (ALL LOCATIONS):
-- Total completed sales: ${total_sales:,.2f} ({yoy_pct:+.1f}% vs prior year)
-- Total covers served: {total_covers} across {total_checks} closed checks
-- Average check: ${avg_check:,.2f}
+TODAY'S COMPLETED SALES (ALL LOCATIONS):
+- Total sales: ${total_sales:,.2f} ({yoy_pct:+.1f}% vs prior year)
+- Covers: {total_covers} across {total_checks} closed checks
+- Avg check: ${avg_check:,.2f}
 - By location:
 {loc_lines}
 
-Write in a confident, concise tone. No bullet points — just flowing prose. Do not invent data."""
+{floor_block}
+
+RULES: Lead with problems if any exist. Flag turn times over 65 min, occupancy over 80%, or waitlist above 5 as concerns. Be specific with numbers. No bullet points — flowing prose only. Do not invent data."""
 
             try:
                 ai_df = conn.query(
