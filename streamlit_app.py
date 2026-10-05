@@ -83,7 +83,7 @@ with st.container(border=True):
 st.space("small")
 
 # ----------------- Helper: Cortex AI Action Items Generator (Floor-Focused Only) -----------------
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=90)
 def generate_ai_operational_directives(location_name, occupancy_pct, seated_count, total_capacity, weather_desc, patio_status, overstay_summary, upcoming_bookings):
     prompt = f"""You are the AI General Manager for Osteria Bella (Contemporary Italian restaurant).
 Analyze this live floor telemetry snapshot:
@@ -105,7 +105,7 @@ Return ONLY valid JSON (no markdown ticks, no commentary) formatted as:
   }}
 ]"""
     try:
-        ai_df = conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT", params=[prompt], ttl=60)
+        ai_df = conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT", params=[prompt], ttl=90)
         raw_text = str(ai_df["AI_OUT"].iloc[0]).strip()
         if raw_text.startswith("```json"): raw_text = raw_text[7:]
         if raw_text.startswith("```"): raw_text = raw_text[3:]
@@ -122,7 +122,7 @@ Return ONLY valid JSON (no markdown ticks, no commentary) formatted as:
             }
         ]
 
-# ----------------- Fragment 1: Executive KPI Row & Live Floor Telemetry -----------------
+# ----------------- Fragment 1: Executive KPI Row & Live Floor Telemetry (Fast Load) -----------------
 @st.fragment(run_every="30s")
 def render_kpi_row(location_filter):
     cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
@@ -190,119 +190,7 @@ def render_kpi_row(location_filter):
         st.metric("Bookings / Waitlist", f"{upcoming_res} / {waitlist_count}", border=True)
         st.metric("Weather & Patio", weather_text, patio_status, delta_color="normal" if "Open" in patio_status else "inverse", border=True)
 
-# ----------------- Fragment 2: Isolated Cortex AI Action Items -----------------
-@st.fragment(run_every="60s")
-def render_ai_section(location_filter):
-    cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
-    cap_df = conn.query(cap_query, ttl=10)
-
-    weather_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER"
-    weather_df = conn.query(weather_query, ttl=15)
-
-    res_where = ""
-    res_params = []
-    if location_filter != "All Locations":
-        res_where = "WHERE LOCATION_NAME = ?"
-        res_params.append(location_filter)
-
-    res_query = f"""
-        SELECT 
-            TABLE_NUMBER, GUEST_NAME, PARTY_SIZE, STATUS, EST_DURATION_MINS, CURRENT_CHECK_TOTAL
-        FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS
-        {res_where}
-    """
-    res_df = conn.query(res_query, params=res_params if res_params else None, ttl=10)
-
-    filtered_cap = cap_df.copy() if not cap_df.empty else pd.DataFrame()
-    if location_filter != "All Locations" and not filtered_cap.empty:
-        filtered_cap = filtered_cap[filtered_cap["LOCATION_NAME"] == location_filter]
-
-    total_seats = int(filtered_cap["MAX_SEATS"].sum()) if not filtered_cap.empty else 0
-    seated_guests = int(filtered_cap["CURRENT_GUESTS_SEATED"].sum()) if not filtered_cap.empty else 0
-    upcoming_res = int(filtered_cap["UPCOMING_RESERVATIONS"].sum()) if not filtered_cap.empty else 0
-    avg_occupancy = round((seated_guests / total_seats * 100), 1) if total_seats > 0 else 0.0
-
-    filtered_weather = weather_df.copy() if not weather_df.empty else pd.DataFrame()
-    if location_filter != "All Locations" and not filtered_weather.empty:
-        filtered_weather = filtered_weather[filtered_weather["LOCATION_NAME"] == location_filter]
-
-    weather_text = "68°F · Sunny"
-    patio_status = "Open"
-    if not filtered_weather.empty:
-        avg_temp = round(filtered_weather["TEMPERATURE_F"].mean(), 1)
-        cond = filtered_weather["CONDITION"].iloc[0] if len(filtered_weather) == 1 else "Clear"
-        patio_open = all(filtered_weather["PATIO_OPEN"])
-        patio_status = "Patio Open" if patio_open else "Patio Closed"
-        weather_text = f"{avg_temp}°F · {cond}"
-
-    overstay_df = res_df[(res_df["STATUS"] == "SEATED") & (res_df["EST_DURATION_MINS"] >= 85)] if not res_df.empty else pd.DataFrame()
-    overstay_summary = "None currently"
-    if not overstay_df.empty:
-        overstay_items = [f"Table {r['TABLE_NUMBER']} ({r['GUEST_NAME']}, party of {r['PARTY_SIZE']}) at {r['EST_DURATION_MINS']}m (tab ${r['CURRENT_CHECK_TOTAL']:.0f})" for _, r in overstay_df.head(2).iterrows()]
-        overstay_summary = "; ".join(overstay_items)
-
-    with st.container(border=True):
-        ai_head_col, ai_badge_col = st.columns([3, 1])
-        with ai_head_col:
-            st.subheader("🤖 Cortex AI Operator Directives & Action Items")
-        with ai_badge_col:
-            st.caption(f"Last AI evaluation: {datetime.now(PACIFIC_TZ).strftime('%I:%M %p PT')}")
-
-        col_actions, col_quick = st.columns([3, 2])
-
-        with col_actions:
-            ai_directives = generate_ai_operational_directives(
-                location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
-            )
-
-            color_map = {
-                "CRITICAL": ("#E53E3E", "#FC8181", "rgba(229,62,62,0.25)", "#FEB2B2", "🔴 Critical"),
-                "WARNING": ("#DD6B20", "#FBD38D", "rgba(221,107,32,0.25)", "#FEEBC8", "🟠 Warning"),
-                "OPPORTUNITY": ("#3182CE", "#63B3ED", "rgba(49,130,206,0.25)", "#BEE3F8", "🔵 Opportunity"),
-                "SUCCESS": ("#38A169", "#68D391", "rgba(56,161,105,0.25)", "#C6F6D5", "🟢 Efficient")
-            }
-
-            for item in ai_directives:
-                sev = item.get("severity", "WARNING").upper()
-                border_col, title_col, badge_bg, badge_fg, badge_label = color_map.get(sev, color_map["WARNING"])
-                
-                st.markdown(f"""
-                <div class="action-card" style="border-left: 4px solid {border_col};">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-                        <strong style="color: {title_col}; font-size: 1.05em;">{item.get('title', 'Operational Item')}</strong>
-                        <span style="font-size: 0.8em; background: {badge_bg}; color: {badge_fg}; padding: 2px 8px; border-radius: 4px; font-weight: bold;">{badge_label}</span>
-                    </div>
-                    <div style="font-size: 0.9em; color: #CBD5E0; line-height: 1.4; margin-bottom: 6px;">
-                        {item.get('description', '')}
-                    </div>
-                    <div style="font-size: 0.9em; color: #F1F5F9; line-height: 1.4; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 6px;">
-                        <strong>Action:</strong> {item.get('action', '')}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-        with col_quick:
-            st.markdown("**Live Walk-In Quotes & Floor Throttle**")
-            wait_2top = 0 if avg_occupancy < 50 else (15 if avg_occupancy < 80 else 30)
-            wait_4top = 5 if avg_occupancy < 50 else (25 if avg_occupancy < 80 else 50)
-            wait_6top = 15 if avg_occupancy < 50 else (40 if avg_occupancy < 80 else 75)
-
-            with st.container(horizontal=True):
-                st.metric("2-Top Walk-In", f"{wait_2top} min" if wait_2top > 0 else "Immediate", border=True)
-                st.metric("4-Top Walk-In", f"{wait_4top} min" if wait_4top > 0 else "Immediate", border=True)
-                st.metric("6+ Group", f"{wait_6top} min", border=True)
-
-            st.space("small")
-            st.markdown("**Quick Operator Actions**")
-            col_b1, col_b2 = st.columns(2)
-            with col_b1:
-                if st.button("Send Limoncello Reset", use_container_width=True, icon=":material/local_bar:"):
-                    st.toast("Floor alert dispatched: Complimentary digestif sent to wrap table.", icon=":material/check:")
-            with col_b2:
-                if st.button("Hold Bar Seating", use_container_width=True, icon=":material/lock:"):
-                    st.toast("Host stand updated: Bar counter restricted to waitlist guests.", icon=":material/check:")
-
-# ----------------- Section 3: Sales Analysis & YoY Performance (Independent Controls) -----------------
+# ----------------- Section 2: Sales Analysis & YoY Performance (Fast Load) -----------------
 def render_sales_section(location_filter):
     with st.container(border=True):
         col_stitle, col_sfilter = st.columns([3, 2], vertical_alignment="center")
@@ -420,7 +308,7 @@ def render_sales_section(location_filter):
             else:
                 st.info("No category data.")
 
-# ----------------- Fragment 3: Floor Capacity & Seating Sections -----------------
+# ----------------- Fragment 3: Floor Capacity & Seating Sections (Fast Load) -----------------
 @st.fragment(run_every="30s")
 def render_capacity_and_stream(location_filter):
     cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
@@ -554,11 +442,132 @@ def render_capacity_and_stream(location_filter):
         else:
             st.info("No active reservations for selected filters.")
 
-# Render granular, isolated dashboard components
+# ----------------- Fragment 4: Async / Isolated Cortex AI Directives Section -----------------
+@st.fragment(run_every="60s")
+def render_ai_section(location_filter):
+    cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
+    cap_df = conn.query(cap_query, ttl=10)
+
+    weather_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER"
+    weather_df = conn.query(weather_query, ttl=15)
+
+    res_where = ""
+    res_params = []
+    if location_filter != "All Locations":
+        res_where = "WHERE LOCATION_NAME = ?"
+        res_params.append(location_filter)
+
+    res_query = f"""
+        SELECT 
+            TABLE_NUMBER, GUEST_NAME, PARTY_SIZE, STATUS, EST_DURATION_MINS, CURRENT_CHECK_TOTAL
+        FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS
+        {res_where}
+    """
+    res_df = conn.query(res_query, params=res_params if res_params else None, ttl=10)
+
+    filtered_cap = cap_df.copy() if not cap_df.empty else pd.DataFrame()
+    if location_filter != "All Locations" and not filtered_cap.empty:
+        filtered_cap = filtered_cap[filtered_cap["LOCATION_NAME"] == location_filter]
+
+    total_seats = int(filtered_cap["MAX_SEATS"].sum()) if not filtered_cap.empty else 0
+    seated_guests = int(filtered_cap["CURRENT_GUESTS_SEATED"].sum()) if not filtered_cap.empty else 0
+    upcoming_res = int(filtered_cap["UPCOMING_RESERVATIONS"].sum()) if not filtered_cap.empty else 0
+    avg_occupancy = round((seated_guests / total_seats * 100), 1) if total_seats > 0 else 0.0
+
+    filtered_weather = weather_df.copy() if not weather_df.empty else pd.DataFrame()
+    if location_filter != "All Locations" and not filtered_weather.empty:
+        filtered_weather = filtered_weather[filtered_weather["LOCATION_NAME"] == location_filter]
+
+    weather_text = "68°F · Sunny"
+    patio_status = "Open"
+    if not filtered_weather.empty:
+        avg_temp = round(filtered_weather["TEMPERATURE_F"].mean(), 1)
+        cond = filtered_weather["CONDITION"].iloc[0] if len(filtered_weather) == 1 else "Clear"
+        patio_open = all(filtered_weather["PATIO_OPEN"])
+        patio_status = "Patio Open" if patio_open else "⚠️ Patio Closed"
+        weather_text = f"{avg_temp}°F · {cond}"
+
+    overstay_df = res_df[(res_df["STATUS"] == "SEATED") & (res_df["EST_DURATION_MINS"] >= 85)] if not res_df.empty else pd.DataFrame()
+    overstay_summary = "None currently"
+    if not overstay_df.empty:
+        overstay_items = [f"Table {r['TABLE_NUMBER']} ({r['GUEST_NAME']}, party of {r['PARTY_SIZE']}) at {r['EST_DURATION_MINS']}m (tab ${r['CURRENT_CHECK_TOTAL']:.0f})" for _, r in overstay_df.head(2).iterrows()]
+        overstay_summary = "; ".join(overstay_items)
+
+    with st.container(border=True):
+        ai_head_col, ai_badge_col = st.columns([3, 1])
+        with ai_head_col:
+            st.subheader("🤖 Cortex AI Operator Directives & Action Items")
+        with ai_badge_col:
+            st.caption(f"Evaluated: {datetime.now(PACIFIC_TZ).strftime('%I:%M %p PT')}")
+
+        col_actions, col_quick = st.columns([3, 2])
+
+        with col_actions:
+            # Wrap AI call in a lightweight spinner so users see visual feedback while the rest of the page is already rendered
+            with st.spinner("Analyzing real-time floor telemetry with Cortex AI..."):
+                ai_directives = generate_ai_operational_directives(
+                    location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
+                )
+
+            color_map = {
+                "CRITICAL": ("#E53E3E", "#FC8181", "rgba(229,62,62,0.25)", "#FEB2B2", "🔴 Critical"),
+                "WARNING": ("#DD6B20", "#FBD38D", "rgba(221,107,32,0.25)", "#FEEBC8", "🟠 Warning"),
+                "OPPORTUNITY": ("#3182CE", "#63B3ED", "rgba(49,130,206,0.25)", "#BEE3F8", "🔵 Opportunity"),
+                "SUCCESS": ("#38A169", "#68D391", "rgba(56,161,105,0.25)", "#C6F6D5", "🟢 Efficient")
+            }
+
+            for item in ai_directives:
+                sev = item.get("severity", "WARNING").upper()
+                border_col, title_col, badge_bg, badge_fg, badge_label = color_map.get(sev, color_map["WARNING"])
+                
+                st.markdown(f"""
+                <div class="action-card" style="border-left: 4px solid {border_col};">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                        <strong style="color: {title_col}; font-size: 1.05em;">{item.get('title', 'Operational Item')}</strong>
+                        <span style="font-size: 0.8em; background: {badge_bg}; color: {badge_fg}; padding: 2px 8px; border-radius: 4px; font-weight: bold;">{badge_label}</span>
+                    </div>
+                    <div style="font-size: 0.9em; color: #CBD5E0; line-height: 1.4; margin-bottom: 6px;">
+                        {item.get('description', '')}
+                    </div>
+                    <div style="font-size: 0.9em; color: #F1F5F9; line-height: 1.4; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 6px;">
+                        <strong>Action:</strong> {item.get('action', '')}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        with col_quick:
+            st.markdown("**Live Walk-In Quotes & Floor Throttle**")
+            wait_2top = 0 if avg_occupancy < 50 else (15 if avg_occupancy < 80 else 30)
+            wait_4top = 5 if avg_occupancy < 50 else (25 if avg_occupancy < 80 else 50)
+            wait_6top = 15 if avg_occupancy < 50 else (40 if avg_occupancy < 80 else 75)
+
+            with st.container(horizontal=True):
+                st.metric("2-Top Walk-In", f"{wait_2top} min" if wait_2top > 0 else "Immediate", border=True)
+                st.metric("4-Top Walk-In", f"{wait_4top} min" if wait_4top > 0 else "Immediate", border=True)
+                st.metric("6+ Group", f"{wait_6top} min", border=True)
+
+            st.space("small")
+            st.markdown("**Quick Operator Actions**")
+            col_b1, col_b2 = st.columns(2)
+            with col_b1:
+                if st.button("Send Limoncello Reset", use_container_width=True, icon=":material/local_bar:"):
+                    st.toast("Floor alert dispatched: Complimentary digestif sent to wrap table.", icon=":material/check:")
+            with col_b2:
+                if st.button("Hold Bar Seating", use_container_width=True, icon=":material/lock:"):
+                    st.toast("Host stand updated: Bar counter restricted to waitlist guests.", icon=":material/check:")
+
+# ----------------- Execution Order (Fast UI Renders First!) -----------------
+# 1. Immediate Executive KPI Metrics
 render_kpi_row(selected_location)
 st.space("medium")
-render_ai_section(selected_location)
-st.space("medium")
+
+# 2. Immediate Sales Pacing & YoY Charts
 render_sales_section(selected_location)
 st.space("medium")
+
+# 3. Immediate Floor Capacity & Live Stream Tables
 render_capacity_and_stream(selected_location)
+st.space("medium")
+
+# 4. Asynchronous / Isolated Cortex AI Section (Never blocks the charts/tables above!)
+render_ai_section(selected_location)
