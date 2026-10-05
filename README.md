@@ -49,16 +49,68 @@ All data in this dashboard is **synthetic and simulated**. No real restaurant, g
 
 ## How Cortex AI Works
 
-The dashboard calls `SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ...)` with a structured prompt containing the current floor telemetry snapshot:
+The AI recommendations are generated in a 5-step pipeline that runs every 30 seconds:
 
-- Current occupancy % and seated guest count
-- Weather conditions and patio status
-- Table overstay bottlenecks (specific tables, party sizes, durations, tab amounts)
-- Upcoming bookings and waitlist pressure
+### Step 1 — Collect Live Floor Data
 
-The AI returns a JSON array of 2-3 operational directives, each with a title, severity classification (CRITICAL/WARNING/OPPORTUNITY/SUCCESS), category (FLOOR/WEATHER/KITCHEN), contextual description, and a concrete action recommendation. The dashboard parses this JSON and renders color-coded action cards.
+The app queries three Snowflake objects to build a real-time snapshot:
 
-Results are cached for 30 seconds via `@st.cache_data(ttl=30)`. The "Re-Analyze Now" button clears the AI cache and forces a fresh evaluation.
+| Data Point | Source | Example |
+|---|---|---|
+| Occupancy & seating | `V_OSTERIA_CAPACITY` | 72.3% occupied, 43 of 60 seats |
+| Weather & patio status | `OSTERIA_WEATHER` | 58.5°F, High Wind, Patio Closed |
+| Table overstays | `OSTERIA_RESERVATIONS` (where `EST_DURATION_MINS >= 85`) | Table T-12, party of 4, 115 min, $295 tab |
+| Waitlist pressure | `V_OSTERIA_CAPACITY` | 8 upcoming parties |
+
+### Step 2 — Build a Structured Prompt
+
+These values are injected into a natural-language prompt that tells the LLM to act as an AI General Manager:
+
+```
+You are the AI General Manager for Osteria Bella...
+Analyze this live floor telemetry snapshot:
+- Location: Downtown Flagship
+- Floor Occupancy: 72.3% (43 seated / 60 total seats)
+- Weather & Patio: 58.5°F · High Wind (Patio Closed)
+- Upcoming Bookings / Waitlist: 8 parties
+- Key Overstay Bottlenecks: Table T-12 (Elena Rostova, party of 4) at 115m (tab $295)
+
+Generate a JSON list of 2-3 concise, tactical operational action items...
+```
+
+The LLM does not have direct access to any tables. It only sees the numbers and context the app puts into the prompt text.
+
+### Step 3 — Call the LLM Inside Snowflake
+
+```sql
+SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT
+```
+
+`SNOWFLAKE.CORTEX.COMPLETE` is a built-in Snowflake function that runs Meta's Llama 3.1 70B model directly inside Snowflake's infrastructure. No data leaves Snowflake, no external API keys are needed. The `?` is a parameterized bind variable — the prompt is passed safely with no SQL injection risk.
+
+### Step 4 — Parse the LLM Response
+
+The model returns a JSON array of directives. Each directive has:
+
+| Field | Purpose | Example |
+|---|---|---|
+| `title` | Short headline | "Expedite Table T-12 Turnover" |
+| `severity` | Priority level | CRITICAL, WARNING, OPPORTUNITY, or SUCCESS |
+| `category` | Operations area | FLOOR, WEATHER, or KITCHEN |
+| `description` | Context with specific numbers | "Party of 4 at 115 min with $295 tab — 50 min past target" |
+| `action` | Concrete directive for the manager | "Send manager to offer complimentary limoncello and present check" |
+
+The app strips any markdown formatting from the response, parses the JSON, and renders each item as a color-coded action card (red = Critical, orange = Warning, blue = Opportunity, green = Success).
+
+### Step 5 — Cache and Refresh
+
+Results are cached for 30 seconds via `@st.cache_data(ttl=30)`. The timestamp of each actual LLM call is stored with the cached result, so the "Last analyzed" label accurately reflects when the AI last ran — not when the page last rendered.
+
+The "Re-Analyze Now" button clears the AI cache and forces a fresh evaluation immediately.
+
+### Why Recommendations Change
+
+Each call is **stateless** — the LLM has no memory of previous analyses. Recommendations change because the underlying data changes: different occupancy levels, different overstay guests, different weather conditions. New data in the prompt produces new reasoning and new directives.
 
 ## Filters & Controls
 
