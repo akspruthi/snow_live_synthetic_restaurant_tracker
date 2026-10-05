@@ -573,10 +573,6 @@ st.space("medium")
 # 4. Floor Capacity & Seating Live Streams
 render_capacity_and_stream(selected_location)
 
-# 5. Single auto-refresh: one fragment reruns the entire page every 30s
-@st.fragment(run_every="30s")
-def _sync_refresh():
-    st.cache_data.clear()
-    st.rerun()
-
-_sync_refresh()
+# 5. Auto-refresh: wait 30s then rerun the entire page in sync
+time.sleep(30)
+st.rerun()
