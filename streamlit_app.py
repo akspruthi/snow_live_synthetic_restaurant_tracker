@@ -50,14 +50,10 @@ with title_col:
     st.title("Osteria Bella")
     st.caption("Contemporary Italian & Enoteca · AI-Powered Real-Time Floor Operations & Capacity Command")
 
-@st.fragment(run_every="30s")
-def render_live_clock():
-    now = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
-    st.badge(f"Live · {now}", icon=":material/sensors:", color="green")
-
 with live_badge_col:
     st.space("small")
-    render_live_clock()
+    now = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
+    st.badge(f"Live · {now}", icon=":material/sensors:", color="green")
 
 # Main Page Filter & Action Ribbon
 with st.container(border=True):
@@ -121,7 +117,6 @@ Return ONLY valid JSON (no markdown ticks, no commentary) formatted as:
         return None
 
 # ----------------- Section 1: Executive KPI Row & Live Floor Telemetry -----------------
-@st.fragment(run_every="30s")
 def render_kpi_row(location_filter):
     cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
     cap_df = conn.query(cap_query, ttl=5)
@@ -430,7 +425,6 @@ def render_sales_section(location_filter):
                 st.info("No category data.")
 
 # ----------------- Section 4: Floor Capacity & Seating Sections -----------------
-@st.fragment(run_every="30s")
 def render_capacity_and_stream(location_filter):
     cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
     cap_df = conn.query(cap_query, ttl=5)
@@ -579,9 +573,12 @@ st.space("medium")
 # 4. Floor Capacity & Seating Live Streams
 render_capacity_and_stream(selected_location)
 
-# 5. Auto-refresh: triggers a full page rerun every 60s to refresh AI and sales data
-@st.fragment(run_every="60s")
-def auto_refresh_trigger():
-    st.rerun()
+# 5. Synchronized auto-refresh: single 30s rerun cycle for the entire dashboard
+if "last_rerun" not in st.session_state:
+    st.session_state["last_rerun"] = time.time()
 
-auto_refresh_trigger()
+elapsed = time.time() - st.session_state["last_rerun"]
+if elapsed >= 30:
+    st.session_state["last_rerun"] = time.time()
+    st.cache_data.clear()
+    st.rerun()
