@@ -543,7 +543,11 @@ def render_sales_section(location_filter):
 # ----------------- Section: Daily Digest -----------------
 def render_daily_digest(location_filter):
     with st.container(border=True):
-        st.subheader("Daily Digest")
+        hdr_col, badge_col = st.columns([3, 1], vertical_alignment="bottom")
+        with hdr_col:
+            st.subheader("Daily Digest")
+        with badge_col:
+            st.caption("Powered by Cortex AI")
 
         loc_where = ""
         loc_params = []
@@ -576,8 +580,9 @@ def render_daily_digest(location_filter):
         top_loc = digest_df.iloc[0]["LOCATION_NAME"]
         top_loc_sales = float(digest_df.iloc[0]["TODAY_SALES"])
         yoy_pct = round(((total_sales - total_py) / total_py * 100), 1) if total_py > 0 else 0.0
+        avg_check = round(total_sales / total_checks, 2) if total_checks > 0 else 0
 
-        # Get live floor pressure (waitlist + upcoming) for the 4th card
+        # Get live floor pressure for single-location narrative
         cap_where = ""
         cap_params = []
         if location_filter != "All Locations":
@@ -590,33 +595,35 @@ def render_daily_digest(location_filter):
         waitlist_now = int(floor_df["WL"].iloc[0]) if not floor_df.empty else 0
         upcoming_now = int(floor_df["UPCOMING"].iloc[0]) if not floor_df.empty else 0
 
-        avg_check = round(total_sales / total_checks, 2) if total_checks > 0 else 0
-
-        col_d1, col_d2, col_d3, col_d4 = st.columns(4)
-        with col_d1:
-            st.metric("Today's Completed Sales", f"${total_sales:,.2f}", f"{yoy_pct:+.1f}% vs PY", border=True)
-        with col_d2:
-            st.metric("Covers Served", f"{total_covers}", f"{total_checks} checks closed", border=True)
-        with col_d3:
-            st.metric("Avg Check", f"${avg_check:,.2f}", border=True)
-        with col_d4:
-            st.metric("Floor Pressure", f"{waitlist_now} waiting", f"{upcoming_now} upcoming", border=True)
-
         # AI narrative digest
         digest_cache = st.session_state.get("_digest_cache", None)
-        digest_key = f"{total_sales:.0f}|{total_covers}|{total_checks}"
+        digest_key = f"{location_filter}|{total_sales:.0f}|{total_covers}|{total_checks}"
 
         if digest_cache and digest_cache.get("key") == digest_key:
             narrative = digest_cache["narrative"]
         else:
-            loc_lines = "\n".join([
-                f"  - {r['LOCATION_NAME']}: ${float(r['TODAY_SALES']):,.0f} sales, {int(r['TODAY_COVERS'])} covers, {int(r['COMPLETED_CHECKS'])} checks"
-                for _, r in digest_df.iterrows()
-            ])
-            digest_prompt = f"""Write a 2-3 sentence executive digest for today's restaurant operations.
-Be specific with numbers. Mention the top performer and any notable patterns.
+            is_single_loc = location_filter != "All Locations"
 
-TODAY'S DATA:
+            if is_single_loc:
+                digest_prompt = f"""Write a 2-3 sentence operations digest for {location_filter} today.
+Focus on check volume, average spend, covers served, and current floor pressure.
+
+TODAY'S DATA FOR {location_filter}:
+- Completed sales: ${total_sales:,.2f} ({yoy_pct:+.1f}% vs prior year)
+- Covers served: {total_covers} across {total_checks} closed checks
+- Average check: ${avg_check:,.2f}
+- Current waitlist: {waitlist_now} parties waiting, {upcoming_now} upcoming reservations
+
+Write in a confident, concise tone about this single location's performance. No bullet points — just flowing prose. Do not compare to other locations. Do not invent data."""
+            else:
+                loc_lines = "\n".join([
+                    f"  - {r['LOCATION_NAME']}: ${float(r['TODAY_SALES']):,.0f} sales, {int(r['TODAY_COVERS'])} covers, {int(r['COMPLETED_CHECKS'])} checks"
+                    for _, r in digest_df.iterrows()
+                ])
+                digest_prompt = f"""Write a 2-3 sentence executive digest for today's restaurant operations across all locations.
+Mention the top performer and any notable patterns between locations.
+
+TODAY'S DATA (ALL LOCATIONS):
 - Total completed sales: ${total_sales:,.2f} ({yoy_pct:+.1f}% vs prior year)
 - Total covers served: {total_covers} across {total_checks} closed checks
 - Average check: ${avg_check:,.2f}
