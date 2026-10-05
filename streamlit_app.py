@@ -6,6 +6,7 @@ import pandas as pd
 import altair as alt
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from streamlit_autorefresh import st_autorefresh
 
 PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
@@ -85,8 +86,8 @@ with st.container(border=True):
 st.space("small")
 
 # ----------------- Helper: Cortex AI Action Items Generator (Live LLM Call) -----------------
-@st.cache_data(ttl=60)
-def generate_ai_operational_directives(location_name, occupancy_pct, seated_count, total_capacity, weather_desc, patio_status, overstay_summary, upcoming_bookings, _time_bucket=0):
+@st.cache_data(ttl=30)
+def generate_ai_operational_directives(location_name, occupancy_pct, seated_count, total_capacity, weather_desc, patio_status, overstay_summary, upcoming_bookings):
     prompt = f"""You are the AI General Manager for Osteria Bella (Contemporary Italian restaurant).
 Analyze this live floor telemetry snapshot:
 - Location: {location_name}
@@ -239,21 +240,12 @@ def render_ai_section(location_filter):
         col_actions, col_quick = st.columns([3, 2])
 
         with col_actions:
-            # Time bucket changes every 60s, forcing a fresh Cortex AI call
-            ai_time_bucket = int(time.time()) // 60
             ai_directives = generate_ai_operational_directives(
-                location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res, _time_bucket=ai_time_bucket
+                location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
             )
 
-            # Track when a fresh AI call actually ran
-            current_bucket = ai_time_bucket
-            last_bucket = st.session_state.get("ai_last_bucket", -1)
-            if current_bucket != last_bucket:
-                st.session_state["ai_last_eval"] = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
-                st.session_state["ai_last_bucket"] = current_bucket
-
-            last_eval = st.session_state.get("ai_last_eval", "Pending...")
-            st.success(f"**Cortex AI (llama3.1-70b)** · Last analyzed: {last_eval} · Auto-refreshes every ~60s", icon=":material/smart_toy:")
+            last_eval = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
+            st.success(f"**Cortex AI (llama3.1-70b)** · Last analyzed: {last_eval} · Refreshes every 30s", icon=":material/smart_toy:")
 
             if ai_directives is None:
                 st.caption("Cortex AI returned no results. Retrying on next refresh cycle.")
@@ -573,6 +565,5 @@ st.space("medium")
 # 4. Floor Capacity & Seating Live Streams
 render_capacity_and_stream(selected_location)
 
-# 5. Auto-refresh: wait 30s then rerun the entire page in sync
-time.sleep(30)
-st.rerun()
+# 5. Auto-refresh: JavaScript timer triggers a clean full-page rerun every 30s
+st_autorefresh(interval=30_000, limit=None, key="dashboard_autorefresh")
