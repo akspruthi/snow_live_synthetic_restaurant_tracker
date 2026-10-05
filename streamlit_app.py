@@ -2,13 +2,12 @@ import os
 import json
 import hashlib
 import time
+import random
 import streamlit as st
 import pandas as pd
 import altair as alt
 from datetime import datetime, timezone, timedelta
 from streamlit_autorefresh import st_autorefresh
-
-AI_MIN_INTERVAL_SECS = 120
 
 st.set_page_config(
     page_title="Osteria Bella — AI Restaurant Operations Command",
@@ -85,6 +84,8 @@ with st.container(border=True):
                     st.cache_data.clear()
                     if "_ai_cache" in st.session_state:
                         del st.session_state["_ai_cache"]
+                    if "_digest_cache" in st.session_state:
+                        del st.session_state["_digest_cache"]
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -100,15 +101,13 @@ _location_changed = _prev_loc != selected_location
 st.session_state["_prev_location"] = selected_location
 
 
-# ----------------- Helper: Cortex AI Suggested Actions (session_state cached) -----------------
+# ----------------- Helper: Cortex AI Suggested Actions -----------------
 def _ai_inputs_hash(location, occupancy, seated, capacity, weather, patio, overstay, bookings):
     raw = f"{location}|{occupancy:.0f}|{seated}|{capacity}|{weather}|{patio}|{overstay}|{bookings}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
 def _call_cortex_ai(location_name, occupancy_pct, seated_count, total_capacity, weather_desc, patio_status, overstay_summary, upcoming_bookings):
-    # Rotate focus areas so suggestions vary across refreshes
-    import random
     focus_pools = [
         "table turnover efficiency, seating optimization, and kitchen timing",
         "guest experience quality, VIP handling, and floor flow bottlenecks",
@@ -390,12 +389,10 @@ def _render_ai_section_inner(location_filter):
                 if st.button("Hold Bar Seating", use_container_width=True, icon=":material/lock:"):
                     st.toast("Host stand updated: Bar counter restricted to waitlist guests.", icon=":material/check:")
 
-            # --- Demo Scenario: controlled step-through ---
+            # --- Demo Scenario ---
             st.space("small")
             st.markdown("**Demo Scenario**")
             st.caption("Step through: pay → cleanup → available → seat next")
-
-            # Determine which location to use for the demo
             demo_loc = location_filter if location_filter != "All Locations" else None
 
             if demo_loc is None:
@@ -541,6 +538,7 @@ def render_sales_section(location_filter):
                 st.altair_chart(cat_chart, use_container_width=True)
             else:
                 st.info("No category data.")
+
 
 # ----------------- Section: Daily Digest -----------------
 def render_daily_digest(location_filter):
