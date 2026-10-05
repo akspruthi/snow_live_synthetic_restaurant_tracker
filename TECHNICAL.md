@@ -13,8 +13,8 @@ Streamlit App (streamlit_app.py)
     │       ├── OSTERIA_RESERVATIONS (table)
     │       └── SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', prompt) ── Cortex AI LLM
     │
-    ├── @st.fragment(run_every="30s") ── KPI Row, Capacity & Guest Stream
-    └── @st.cache_data(ttl=45) ──────── AI Directives (Cortex AI)
+    ├── streamlit-autorefresh (30s JS timer) ── Full-page synchronized rerun
+    └── @st.cache_data(ttl=30) ────────────── AI Directives (Cortex AI)
 ```
 
 ## Snowflake Database Objects
@@ -47,19 +47,21 @@ All objects reside in `RESTAURANT_STREAM_DEMO.PUBLIC`.
 ### How the LLM is Called
 
 ```python
-@st.cache_data(ttl=45)
+@st.cache_data(ttl=30)
 def generate_ai_operational_directives(...):
     ai_df = conn.query(
         "SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT",
         params=[prompt],
         ttl=45
     )
+    # Returns (directives_list, analyzed_at_timestamp)
+    return json.loads(raw_text.strip()), analyzed_at
 ```
 
 - **Model**: `llama3.1-70b` (runs natively inside Snowflake — no external API keys or EAI needed)
 - **Input**: Structured prompt with current occupancy %, weather, table overstays, and waitlist counts
 - **Output**: JSON array of 2-3 operational directives with `title`, `severity`, `category`, `description`, `action`
-- **Caching**: `@st.cache_data(ttl=45)` prevents redundant LLM calls within 45 seconds
+- **Caching**: `@st.cache_data(ttl=30)` prevents redundant LLM calls within 30 seconds. The timestamp of the actual LLM call is baked into the cached return value, so the "Last analyzed" label only updates when a fresh call runs — not on every page render.
 - **Cost**: ~0.78 credits per 1M tokens. Each call is ~450 tokens ($0.0004 per call)
 
 ### Required Cortex Privilege
@@ -150,10 +152,24 @@ GRANT ROLE OSTERIA_APP_PUBLIC_ROLE TO USER OSTERIA_APP_SERVICE_USER;
 
 | Section | Render Strategy | Refresh Cycle |
 |---------|-----------------|---------------|
-| KPI Row | `@st.fragment(run_every="30s")` | Auto every 30s |
-| AI Directives | `@st.cache_data(ttl=45)` + on-demand "Re-Analyze" button | Cached 45s, manual override available |
-| Sales & YoY Charts | Standard function (no fragment) | On page load + time window change |
-| Capacity & Guest Feed | `@st.fragment(run_every="30s")` | Auto every 30s |
+| Live Clock | Inline `datetime.now()` | Updates on each page rerun (every 30s) |
+| KPI Row | Plain function, queries with `ttl=5` | Every rerun (data re-fetches when TTL expires) |
+| AI Directives | `@st.cache_data(ttl=30)` with baked-in timestamp | Fresh LLM call every ~30s; "Re-Analyze Now" button clears cache for immediate re-evaluation |
+| Sales & YoY Charts | Plain function, queries with `ttl=10` | Every rerun + on time window filter change |
+| Capacity & Guest Feed | Plain function, queries with `ttl=5` | Every rerun |
+| **Page Rerun** | `streamlit-autorefresh` (client-side JS timer) | Every 30 seconds; browser throttles when tab is inactive |
+
+### Scheduled Data Generation
+
+| Object | Type | Schedule |
+|--------|------|----------|
+| `TASK_OSTERIA_TELEMETRY_STREAM` | Snowflake Task | Every 5 minutes (currently SUSPENDED) |
+
+The task calls `SP_GENERATE_OSTERIA_TELEMETRY()` to regenerate reservations, weather, and floor data on a schedule. Resume it before a demo with:
+
+```sql
+ALTER TASK RESTAURANT_STREAM_DEMO.PUBLIC.TASK_OSTERIA_TELEMETRY_STREAM RESUME;
+```
 
 ## Theme Configuration
 
