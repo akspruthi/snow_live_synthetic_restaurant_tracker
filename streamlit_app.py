@@ -393,7 +393,7 @@ def _render_ai_section_inner(location_filter):
                     with st.spinner("Advancing demo..."):
                         try:
                             with conn.cursor() as cur:
-                                cur.execute("CALL RESTAURANT_STREAM_DEMO.PUBLIC.SP_OSTERIA_DEMO_STEP(%s)", (demo_loc,))
+                                cur.execute("CALL RESTAURANT_STREAM_DEMO.PUBLIC.SP_OSTERIA_DEMO_STEP(?)", (demo_loc,))
                                 msg = cur.fetchone()[0]
                             if "STEP 1" in msg:
                                 st.toast(msg, icon=":material/receipt_long:")
