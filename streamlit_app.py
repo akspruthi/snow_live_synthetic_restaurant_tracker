@@ -63,9 +63,11 @@ with st.container(border=True):
         if st.button("Simulate Floor Shifts", icon=":material/autorenew:", use_container_width=True):
             with st.spinner("Simulating table turns, floor checks, and weather shifts..."):
                 try:
-                    conn.session().sql("CALL RESTAURANT_STREAM_DEMO.PUBLIC.SP_GENERATE_OSTERIA_TELEMETRY()").collect()
+                    with conn.cursor() as cur:
+                        cur.execute("CALL RESTAURANT_STREAM_DEMO.PUBLIC.SP_GENERATE_OSTERIA_TELEMETRY()")
                     st.toast("Floor telemetry updated with live variance!", icon=":material/check_circle:")
                     st.cache_data.clear()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
 
@@ -99,10 +101,9 @@ Return ONLY valid JSON (no markdown ticks, no commentary) formatted as:
   }}
 ]"""
     try:
-        session = conn.session()
-        escaped_prompt = prompt.replace("'", "''")
-        res = session.sql(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', '{escaped_prompt}') AS AI_OUT").collect()
-        raw_text = res[0]["AI_OUT"].strip()
+        # Safe parameterized execution via conn.query without requiring snowpark
+        ai_df = conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT", params=[prompt], ttl=30)
+        raw_text = str(ai_df["AI_OUT"].iloc[0]).strip()
         if raw_text.startswith("```json"): raw_text = raw_text[7:]
         if raw_text.startswith("```"): raw_text = raw_text[3:]
         if raw_text.endswith("```"): raw_text = raw_text[:-3]
