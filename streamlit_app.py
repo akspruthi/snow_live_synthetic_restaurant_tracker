@@ -5,11 +5,9 @@ import time
 import streamlit as st
 import pandas as pd
 import altair as alt
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
 from streamlit_autorefresh import st_autorefresh
 
-PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 AI_MIN_INTERVAL_SECS = 120
 
 st.set_page_config(
@@ -21,6 +19,18 @@ st.set_page_config(
 
 # Connect to Snowflake
 conn = st.connection("snowflake", ttl=os.getenv("SNOWFLAKE_CONNECTION_TTL"))
+
+
+def _get_pacific_time_str():
+    try:
+        row = conn.query(
+            "SELECT TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()), 'HH12:MI:SS AM') AS PT",
+            ttl=5
+        )
+        return row["PT"].iloc[0] + " PT"
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%I:%M:%S %p") + " UTC"
+
 
 # Custom luxury styling enhancements
 st.markdown("""
@@ -41,17 +51,6 @@ st.markdown("""
         border-right: 1px solid rgba(255, 255, 255, 0.05);
         border-bottom: 1px solid rgba(255, 255, 255, 0.05);
     }
-    .weather-inline {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        font-size: 0.85em;
-        color: #94A3B8;
-        background: #171F2C;
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 6px;
-        padding: 4px 12px;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -63,7 +62,7 @@ with title_col:
 
 with live_badge_col:
     st.space("small")
-    now = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
+    now = _get_pacific_time_str()
     st.badge(f"Live · {now}", icon=":material/sensors:", color="green")
 
 # Main Page Filter & Action Ribbon
@@ -163,7 +162,7 @@ def get_ai_suggestions(location, occupancy, seated, capacity, weather, patio, ov
             return cache["directives"], cache["analyzed_at"]
 
     directives = _call_cortex_ai(location, occupancy, seated, capacity, weather, patio, overstay, bookings)
-    analyzed_at = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
+    analyzed_at = _get_pacific_time_str()
     st.session_state["_ai_cache"] = {
         "directives": directives,
         "analyzed_at": analyzed_at,
@@ -234,7 +233,6 @@ def _render_kpi_row_inner(location_filter):
         patio_status = "Patio Open" if patio_open else "Patio Closed"
         weather_text = f"{avg_temp}°F · {cond}"
 
-    # Compact weather inline below KPIs
     with st.container(horizontal=True):
         st.metric("Live Floor Sales", f"${live_floor_sales:,.2f}", f"{active_tables} tables active", border=True)
         st.metric("Floor Occupancy", f"{seated_guests} / {total_seats} seats", f"{avg_occupancy:.1f}% occupied", border=True)
@@ -242,8 +240,7 @@ def _render_kpi_row_inner(location_filter):
         st.metric("RevPASH ($/Seat-Hr)", f"${revpash:.2f}", revpash_delta_str, border=True)
         st.metric("Bookings / Waitlist", f"{upcoming_res} / {waitlist_count}", border=True)
 
-    patio_icon = ":material/wb_sunny:" if "Open" in patio_status else ":material/cloud:"
-    st.caption(f"{patio_icon} {weather_text} · {patio_status}")
+    st.caption(f"{weather_text} · {patio_status}")
 
 
 # ----------------- Section: Suggested Actions (AI) -----------------
@@ -309,9 +306,9 @@ def _render_ai_section_inner(location_filter):
     with st.container(border=True):
         hdr_col, time_col, btn_col = st.columns([2.5, 2, 1.5], vertical_alignment="bottom")
         with hdr_col:
-            st.subheader("Suggested Actions", anchor=False)
+            st.subheader("Suggested Actions")
         with time_col:
-            st.caption(f":material/smart_toy: Cortex AI · Analyzed {analyzed_at}")
+            st.caption(f"Cortex AI · Analyzed {analyzed_at}")
         with btn_col:
             if st.button("Re-Analyze Now", icon=":material/smart_toy:", use_container_width=True):
                 st.session_state["_ai_force_reanalyze"] = True
@@ -380,6 +377,42 @@ def _render_ai_section_inner(location_filter):
             with col_b2:
                 if st.button("Hold Bar Seating", use_container_width=True, icon=":material/lock:"):
                     st.toast("Host stand updated: Bar counter restricted to waitlist guests.", icon=":material/check:")
+
+            # --- Demo Scenario: controlled step-through ---
+            st.space("small")
+            st.markdown("**Demo Scenario**")
+            st.caption("Step through: pay → cleanup → available → seat next")
+
+            # Determine which location to use for the demo
+            demo_loc = location_filter if location_filter != "All Locations" else None
+
+            if demo_loc is None:
+                st.info("Select a single location to run the demo scenario.", icon=":material/info:")
+            else:
+                if st.button("Advance Demo Step", use_container_width=True, icon=":material/play_arrow:", type="primary"):
+                    with st.spinner("Advancing demo..."):
+                        try:
+                            result_df = conn.query(
+                                "CALL RESTAURANT_STREAM_DEMO.PUBLIC.SP_OSTERIA_DEMO_STEP(?)",
+                                params=[demo_loc],
+                                ttl=0
+                            )
+                            msg = str(result_df.iloc[0, 0])
+                            # Extract step number for appropriate icon
+                            if "STEP 1" in msg:
+                                st.toast(msg, icon=":material/receipt_long:")
+                            elif "STEP 2" in msg:
+                                st.toast(msg, icon=":material/cleaning_services:")
+                            elif "STEP 3" in msg:
+                                st.toast(msg, icon=":material/event_available:")
+                            elif "STEP 4" in msg:
+                                st.toast(msg, icon=":material/airline_seat_recline_normal:")
+                            else:
+                                st.toast(msg, icon=":material/info:")
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Demo step error: {e}")
 
 
 # ----------------- Section: Sales Analysis & YoY Performance -----------------
