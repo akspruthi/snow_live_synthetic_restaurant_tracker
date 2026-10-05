@@ -218,14 +218,13 @@ def render_kpi_row(location_filter):
         st.metric("Bookings / Waitlist", f"{upcoming_res} / {waitlist_count}", border=True)
         st.metric("Weather & Patio", weather_text, patio_status, delta_color="normal" if "Open" in patio_status else "inverse", border=True)
 
-# ----------------- Section 2: Real-Time Cortex AI Directives (Independent Fragment) -----------------
-@st.fragment(run_every="45s")
+# ----------------- Section 2: AI Directives (Instant Rule Engine + On-Demand Cortex AI) -----------------
 def render_ai_section(location_filter):
     cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
-    cap_df = conn.query(cap_query, ttl=10)
+    cap_df = conn.query(cap_query, ttl=5)
 
     weather_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER"
-    weather_df = conn.query(weather_query, ttl=15)
+    weather_df = conn.query(weather_query, ttl=10)
 
     res_where = ""
     res_params = []
@@ -239,7 +238,7 @@ def render_ai_section(location_filter):
         FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS
         {res_where}
     """
-    res_df = conn.query(res_query, params=res_params if res_params else None, ttl=10)
+    res_df = conn.query(res_query, params=res_params if res_params else None, ttl=5)
 
     filtered_cap = cap_df.copy() if not cap_df.empty else pd.DataFrame()
     if location_filter != "All Locations" and not filtered_cap.empty:
@@ -271,44 +270,45 @@ def render_ai_section(location_filter):
         overstay_summary = "; ".join(overstay_items)
 
     with st.container(border=True):
-        ai_head_col, ai_badge_col = st.columns([3, 1])
+        ai_source = st.session_state.get(f"ai_source_{location_filter}", "rules")
+
+        # Prominent status banner
+        if ai_source == "cortex":
+            st.success("**Cortex AI (llama3.1-70b)** is actively analyzing your live floor telemetry.", icon=":material/smart_toy:")
+        else:
+            st.info("**Rules Engine** is providing instant operational directives. Click below to upgrade to Cortex AI analysis.", icon=":material/bolt:")
+
+        ai_head_col, ai_btn_col = st.columns([3, 2], vertical_alignment="bottom")
         with ai_head_col:
-            st.subheader("🤖 Cortex AI Operator Directives & Action Items")
-        with ai_badge_col:
-            cache_key_check = f"ai_directives_{location_filter}"
-            is_ai_live = cache_key_check in st.session_state and st.session_state.get(f"ai_source_{location_filter}") == "cortex"
-            if is_ai_live:
-                st.badge("Cortex AI Live", icon=":material/smart_toy:", color="green")
-            else:
-                st.badge("Initializing...", icon=":material/hourglass_top:", color="orange")
-            st.caption(f"{datetime.now(PACIFIC_TZ).strftime('%I:%M:%S %p PT')}")
+            st.subheader("🤖 Operator Directives & Action Items")
+        with ai_btn_col:
+            ai_clicked = st.button(
+                "🧠 Analyze with Cortex AI" if ai_source != "cortex" else "🧠 Re-Analyze with Cortex AI",
+                icon=":material/smart_toy:", 
+                use_container_width=True
+            )
 
-        col_actions, col_quick = st.columns([3, 2])
+        # Always start with instant rule-based directives
+        cache_key = f"ai_directives_{location_filter}"
+        if cache_key not in st.session_state:
+            st.session_state[cache_key] = get_instant_directives(avg_occupancy, overstay_summary, patio_open, upcoming_res)
+            st.session_state[f"ai_source_{location_filter}"] = "rules"
 
-        with col_actions:
-            # On first load: show instant rule-based directives (0ms)
-            # On subsequent fragment refreshes (every 45s): call Cortex AI and upgrade
-            cache_key = f"ai_directives_{location_filter}"
-            is_first_load = cache_key not in st.session_state
-
-            if is_first_load:
-                # Instant render — no LLM call, no blocking
-                ai_directives = get_instant_directives(avg_occupancy, overstay_summary, patio_open, upcoming_res)
-                st.session_state[cache_key] = ai_directives
-                st.session_state[f"ai_source_{location_filter}"] = "rules"
-                # Cortex AI will replace these on the next 45s fragment cycle
-            else:
-                # Background refresh: call Cortex AI (cached with 45s TTL)
+        # If user clicked the AI button, call Cortex AI now (blocks only this section)
+        if ai_clicked:
+            with st.spinner("Cortex AI analyzing live floor telemetry..."):
                 cortex_result = generate_ai_operational_directives(
                     location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
                 )
                 if cortex_result is not None:
-                    ai_directives = cortex_result
-                    st.session_state[cache_key] = ai_directives
+                    st.session_state[cache_key] = cortex_result
                     st.session_state[f"ai_source_{location_filter}"] = "cortex"
-                else:
-                    ai_directives = st.session_state[cache_key]
 
+        ai_directives = st.session_state[cache_key]
+
+        col_actions, col_quick = st.columns([3, 2])
+
+        with col_actions:
             color_map = {
                 "CRITICAL": ("#E53E3E", "#FC8181", "rgba(229,62,62,0.25)", "#FEB2B2", "🔴 Critical"),
                 "WARNING": ("#DD6B20", "#FBD38D", "rgba(221,107,32,0.25)", "#FEEBC8", "🟠 Warning"),
