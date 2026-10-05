@@ -577,16 +577,30 @@ def render_daily_digest(location_filter):
         top_loc_sales = float(digest_df.iloc[0]["TODAY_SALES"])
         yoy_pct = round(((total_sales - total_py) / total_py * 100), 1) if total_py > 0 else 0.0
 
+        # Get live floor pressure (waitlist + upcoming) for the 4th card
+        cap_where = ""
+        cap_params = []
+        if location_filter != "All Locations":
+            cap_where = "WHERE LOCATION_NAME = ?"
+            cap_params.append(location_filter)
+        floor_df = conn.query(f"""
+            SELECT COALESCE(SUM(WAITLIST_COUNT),0) AS WL, COALESCE(SUM(UPCOMING_RESERVATIONS),0) AS UPCOMING
+            FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY {cap_where}
+        """, params=cap_params if cap_params else None, ttl=5)
+        waitlist_now = int(floor_df["WL"].iloc[0]) if not floor_df.empty else 0
+        upcoming_now = int(floor_df["UPCOMING"].iloc[0]) if not floor_df.empty else 0
+
+        avg_check = round(total_sales / total_checks, 2) if total_checks > 0 else 0
+
         col_d1, col_d2, col_d3, col_d4 = st.columns(4)
         with col_d1:
             st.metric("Today's Completed Sales", f"${total_sales:,.2f}", f"{yoy_pct:+.1f}% vs PY", border=True)
         with col_d2:
             st.metric("Covers Served", f"{total_covers}", f"{total_checks} checks closed", border=True)
         with col_d3:
-            avg_check = round(total_sales / total_checks, 2) if total_checks > 0 else 0
             st.metric("Avg Check", f"${avg_check:,.2f}", border=True)
         with col_d4:
-            st.metric("Top Location", top_loc, f"${top_loc_sales:,.0f}", border=True)
+            st.metric("Floor Pressure", f"{waitlist_now} waiting", f"{upcoming_now} upcoming", border=True)
 
         # AI narrative digest
         digest_cache = st.session_state.get("_digest_cache", None)
@@ -755,12 +769,12 @@ def render_capacity_and_stream(location_filter):
             st.info("No active reservations for selected filters.")
 
 # ----------------- Execution Layout -----------------
+render_daily_digest(selected_location)
+st.space("small")
 render_kpi_row(selected_location)
 render_ai_section(selected_location)
 st.space("small")
 render_sales_section(selected_location)
-st.space("small")
-render_daily_digest(selected_location)
 st.space("small")
 render_capacity_and_stream(selected_location)
 
