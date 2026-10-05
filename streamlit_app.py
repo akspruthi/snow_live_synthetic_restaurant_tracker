@@ -4,6 +4,9 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
 st.set_page_config(
     page_title="Osteria Bella — AI Restaurant Operations Command",
@@ -47,7 +50,8 @@ with title_col:
     st.caption("Contemporary Italian & Enoteca · AI-Powered Real-Time Floor Operations & Capacity Command")
 with live_badge_col:
     st.space("small")
-    st.badge(f"Live Stream · {datetime.now().strftime('%H:%M:%S')}", icon=":material/sensors:", color="green")
+    pacific_now = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
+    st.badge(f"Live · {pacific_now}", icon=":material/sensors:", color="green")
 
 # Main Page Filter & Action Ribbon
 with st.container(border=True):
@@ -101,8 +105,7 @@ Return ONLY valid JSON (no markdown ticks, no commentary) formatted as:
   }}
 ]"""
     try:
-        # Safe parameterized execution via conn.query without requiring snowpark
-        ai_df = conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT", params=[prompt], ttl=30)
+        ai_df = conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT", params=[prompt], ttl=60)
         raw_text = str(ai_df["AI_OUT"].iloc[0]).strip()
         if raw_text.startswith("```json"): raw_text = raw_text[7:]
         if raw_text.startswith("```"): raw_text = raw_text[3:]
@@ -119,19 +122,15 @@ Return ONLY valid JSON (no markdown ticks, no commentary) formatted as:
             }
         ]
 
-# ----------------- Main Operations Dashboard Fragment -----------------
+# ----------------- Fragment 1: Executive KPI Row & Live Floor Telemetry -----------------
 @st.fragment(run_every="30s")
-def render_operations_dashboard(location_filter):
-    # ----------------- Data Queries -----------------
-    # 1. Capacity & Floor Telemetry
+def render_kpi_row(location_filter):
     cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
     cap_df = conn.query(cap_query, ttl=5)
 
-    # 2. Weather
     weather_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER"
     weather_df = conn.query(weather_query, ttl=10)
 
-    # 3. Reservations
     res_where = ""
     res_params = []
     if location_filter != "All Locations":
@@ -140,18 +139,12 @@ def render_operations_dashboard(location_filter):
 
     res_query = f"""
         SELECT 
-            RESERVATION_ID, LOCATION_NAME, GUEST_NAME, PARTY_SIZE, TABLE_NUMBER, 
-            STATUS, SEATING_AREA, RESERVATION_TIME, SEATED_AT, EST_DURATION_MINS, 
-            VIP_TIER, DIETARY_NOTES, CURRENT_CHECK_TOTAL
+            STATUS, EST_DURATION_MINS
         FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS
         {res_where}
-        ORDER BY 
-            CASE STATUS WHEN 'SEATED' THEN 1 WHEN 'WAITLIST' THEN 2 ELSE 3 END,
-            RESERVATION_TIME DESC
     """
     res_df = conn.query(res_query, params=res_params if res_params else None, ttl=5)
 
-    # Filtered capacity metrics
     filtered_cap = cap_df.copy() if not cap_df.empty else pd.DataFrame()
     if location_filter != "All Locations" and not filtered_cap.empty:
         filtered_cap = filtered_cap[filtered_cap["LOCATION_NAME"] == location_filter]
@@ -163,23 +156,19 @@ def render_operations_dashboard(location_filter):
     waitlist_count = int(filtered_cap["WAITLIST_COUNT"].sum()) if not filtered_cap.empty else 0
     live_floor_sales = float(filtered_cap["LIVE_FLOOR_REVENUE"].sum()) if not filtered_cap.empty else 0.0
     
-    # Pure Python percentage calculation (e.g. 16/60 = 26.7)
     avg_occupancy = round((seated_guests / total_seats * 100), 1) if total_seats > 0 else 0.0
 
-    # RevPASH Calculation ($/Seat-Hour)
     operating_hours = 6.0
     revpash = round(live_floor_sales / (total_seats * operating_hours), 2) if total_seats > 0 else 0.0
     revpash_target = 6.50
     revpash_diff = round(((revpash - revpash_target) / revpash_target * 100), 1)
     revpash_delta_str = f"{revpash_diff:+.1f}% vs Target"
 
-    # Avg Table Turn Time
     avg_turn_mins = int(res_df[res_df["STATUS"] == "SEATED"]["EST_DURATION_MINS"].mean()) if not res_df.empty and not res_df[res_df["STATUS"] == "SEATED"].empty else 65
     turn_target = 65
     turn_diff = avg_turn_mins - turn_target
     turn_delta_str = f"{turn_diff:+d}m vs 65m Target"
 
-    # Weather
     filtered_weather = weather_df.copy() if not weather_df.empty else pd.DataFrame()
     if location_filter != "All Locations" and not filtered_weather.empty:
         filtered_weather = filtered_weather[filtered_weather["LOCATION_NAME"] == location_filter]
@@ -193,14 +182,6 @@ def render_operations_dashboard(location_filter):
         patio_status = "Patio Open" if patio_open else "⚠️ Patio Closed"
         weather_text = f"{avg_temp}°F · {cond}"
 
-    # Overstay summary string for AI
-    overstay_df = res_df[(res_df["STATUS"] == "SEATED") & (res_df["EST_DURATION_MINS"] >= 85)] if not res_df.empty else pd.DataFrame()
-    overstay_summary = "None currently"
-    if not overstay_df.empty:
-        overstay_items = [f"Table {r['TABLE_NUMBER']} ({r['GUEST_NAME']}, party of {r['PARTY_SIZE']}) at {r['EST_DURATION_MINS']}m (tab ${r['CURRENT_CHECK_TOTAL']:.0f})" for _, r in overstay_df.head(2).iterrows()]
-        overstay_summary = "; ".join(overstay_items)
-
-    # ----------------- 1. Executive Operations KPI Row -----------------
     with st.container(horizontal=True):
         st.metric("Live Floor Sales", f"${live_floor_sales:,.2f}", f"{active_tables} tables active", border=True)
         st.metric("Floor Occupancy", f"{seated_guests} / {total_seats} seats", f"{avg_occupancy:.1f}% occupied", border=True)
@@ -209,20 +190,67 @@ def render_operations_dashboard(location_filter):
         st.metric("Bookings / Waitlist", f"{upcoming_res} / {waitlist_count}", border=True)
         st.metric("Weather & Patio", weather_text, patio_status, delta_color="normal" if "Open" in patio_status else "inverse", border=True)
 
-    st.space("medium")
+# ----------------- Fragment 2: Isolated Cortex AI Action Items -----------------
+@st.fragment(run_every="60s")
+def render_ai_section(location_filter):
+    cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
+    cap_df = conn.query(cap_query, ttl=10)
 
-    # ----------------- 2. Cortex AI Action Items & Floor Bottlenecks -----------------
+    weather_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER"
+    weather_df = conn.query(weather_query, ttl=15)
+
+    res_where = ""
+    res_params = []
+    if location_filter != "All Locations":
+        res_where = "WHERE LOCATION_NAME = ?"
+        res_params.append(location_filter)
+
+    res_query = f"""
+        SELECT 
+            TABLE_NUMBER, GUEST_NAME, PARTY_SIZE, STATUS, EST_DURATION_MINS, CURRENT_CHECK_TOTAL
+        FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS
+        {res_where}
+    """
+    res_df = conn.query(res_query, params=res_params if res_params else None, ttl=10)
+
+    filtered_cap = cap_df.copy() if not cap_df.empty else pd.DataFrame()
+    if location_filter != "All Locations" and not filtered_cap.empty:
+        filtered_cap = filtered_cap[filtered_cap["LOCATION_NAME"] == location_filter]
+
+    total_seats = int(filtered_cap["MAX_SEATS"].sum()) if not filtered_cap.empty else 0
+    seated_guests = int(filtered_cap["CURRENT_GUESTS_SEATED"].sum()) if not filtered_cap.empty else 0
+    upcoming_res = int(filtered_cap["UPCOMING_RESERVATIONS"].sum()) if not filtered_cap.empty else 0
+    avg_occupancy = round((seated_guests / total_seats * 100), 1) if total_seats > 0 else 0.0
+
+    filtered_weather = weather_df.copy() if not weather_df.empty else pd.DataFrame()
+    if location_filter != "All Locations" and not filtered_weather.empty:
+        filtered_weather = filtered_weather[filtered_weather["LOCATION_NAME"] == location_filter]
+
+    weather_text = "68°F · Sunny"
+    patio_status = "Open"
+    if not filtered_weather.empty:
+        avg_temp = round(filtered_weather["TEMPERATURE_F"].mean(), 1)
+        cond = filtered_weather["CONDITION"].iloc[0] if len(filtered_weather) == 1 else "Clear"
+        patio_open = all(filtered_weather["PATIO_OPEN"])
+        patio_status = "Patio Open" if patio_open else "Patio Closed"
+        weather_text = f"{avg_temp}°F · {cond}"
+
+    overstay_df = res_df[(res_df["STATUS"] == "SEATED") & (res_df["EST_DURATION_MINS"] >= 85)] if not res_df.empty else pd.DataFrame()
+    overstay_summary = "None currently"
+    if not overstay_df.empty:
+        overstay_items = [f"Table {r['TABLE_NUMBER']} ({r['GUEST_NAME']}, party of {r['PARTY_SIZE']}) at {r['EST_DURATION_MINS']}m (tab ${r['CURRENT_CHECK_TOTAL']:.0f})" for _, r in overstay_df.head(2).iterrows()]
+        overstay_summary = "; ".join(overstay_items)
+
     with st.container(border=True):
         ai_head_col, ai_badge_col = st.columns([3, 1])
         with ai_head_col:
             st.subheader("🤖 Cortex AI Operator Directives & Action Items")
         with ai_badge_col:
-            st.caption("Powered by `Snowflake Cortex (llama3.1-70b)`")
+            st.caption(f"Last AI evaluation: {datetime.now(PACIFIC_TZ).strftime('%I:%M %p PT')}")
 
         col_actions, col_quick = st.columns([3, 2])
 
         with col_actions:
-            # Query Cortex AI for live real-time analysis (independent of sales time window)
             ai_directives = generate_ai_operational_directives(
                 location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
             )
@@ -274,9 +302,8 @@ def render_operations_dashboard(location_filter):
                 if st.button("Hold Bar Seating", use_container_width=True, icon=":material/lock:"):
                     st.toast("Host stand updated: Bar counter restricted to waitlist guests.", icon=":material/check:")
 
-    st.space("medium")
-
-    # ----------------- 3. Sales Analysis & YoY Performance (Isolated Filter) -----------------
+# ----------------- Section 3: Sales Analysis & YoY Performance (Independent Controls) -----------------
+def render_sales_section(location_filter):
     with st.container(border=True):
         col_stitle, col_sfilter = st.columns([3, 2], vertical_alignment="center")
         with col_stitle:
@@ -289,7 +316,6 @@ def render_operations_dashboard(location_filter):
                 label_visibility="collapsed"
             )
 
-        # Sales queries based on time_period
         sales_where_clauses = []
         sales_params = []
         if location_filter != "All Locations":
@@ -327,7 +353,7 @@ def render_operations_dashboard(location_filter):
             GROUP BY {group_col}
             ORDER BY {group_col} ASC
         """
-        sales_history_df = conn.query(history_sql, params=sales_params if sales_params else None, ttl=15)
+        sales_history_df = conn.query(history_sql, params=sales_params if sales_params else None, ttl=30)
 
         cat_sql = f"""
             SELECT 
@@ -338,9 +364,8 @@ def render_operations_dashboard(location_filter):
             GROUP BY CATEGORY
             ORDER BY TOTAL_CATEGORY_SALES DESC
         """
-        cat_df = conn.query(cat_sql, params=sales_params if sales_params else None, ttl=15)
+        cat_df = conn.query(cat_sql, params=sales_params if sales_params else None, ttl=30)
 
-        # YoY Growth within selected time window
         yoy_growth_window = 0.0
         yoy_growth_str = "+0.0% YoY"
         if not sales_history_df.empty:
@@ -395,9 +420,35 @@ def render_operations_dashboard(location_filter):
             else:
                 st.info("No category data.")
 
-    st.space("medium")
+# ----------------- Fragment 3: Floor Capacity & Seating Sections -----------------
+@st.fragment(run_every="30s")
+def render_capacity_and_stream(location_filter):
+    cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
+    cap_df = conn.query(cap_query, ttl=5)
 
-    # ----------------- 4. Floor Capacity & Seating Sections -----------------
+    res_where = ""
+    res_params = []
+    if location_filter != "All Locations":
+        res_where = "WHERE LOCATION_NAME = ?"
+        res_params.append(location_filter)
+
+    res_query = f"""
+        SELECT 
+            RESERVATION_ID, LOCATION_NAME, GUEST_NAME, PARTY_SIZE, TABLE_NUMBER, 
+            STATUS, SEATING_AREA, RESERVATION_TIME, SEATED_AT, EST_DURATION_MINS, 
+            VIP_TIER, DIETARY_NOTES, CURRENT_CHECK_TOTAL
+        FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS
+        {res_where}
+        ORDER BY 
+            CASE STATUS WHEN 'SEATED' THEN 1 WHEN 'WAITLIST' THEN 2 ELSE 3 END,
+            RESERVATION_TIME DESC
+    """
+    res_df = conn.query(res_query, params=res_params if res_params else None, ttl=5)
+
+    filtered_cap = cap_df.copy() if not cap_df.empty else pd.DataFrame()
+    if location_filter != "All Locations" and not filtered_cap.empty:
+        filtered_cap = filtered_cap[filtered_cap["LOCATION_NAME"] == location_filter]
+
     with st.container(border=True):
         st.subheader("🪑 Location Capacity & Live Table Turnover")
 
@@ -475,7 +526,6 @@ def render_operations_dashboard(location_filter):
 
     st.space("medium")
 
-    # ----------------- 5. Live Incoming Reservations Stream -----------------
     with st.container(border=True):
         st.subheader("⏱️ Live Guest Flow & Seating Stream")
 
@@ -504,5 +554,11 @@ def render_operations_dashboard(location_filter):
         else:
             st.info("No active reservations for selected filters.")
 
-# Execute live fragment
-render_operations_dashboard(selected_location)
+# Render granular, isolated dashboard components
+render_kpi_row(selected_location)
+st.space("medium")
+render_ai_section(selected_location)
+st.space("medium")
+render_sales_section(selected_location)
+st.space("medium")
+render_capacity_and_stream(selected_location)
