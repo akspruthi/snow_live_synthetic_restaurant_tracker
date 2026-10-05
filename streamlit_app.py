@@ -392,13 +392,9 @@ def _render_ai_section_inner(location_filter):
                 if st.button("Advance Demo Step", use_container_width=True, icon=":material/play_arrow:", type="primary"):
                     with st.spinner("Advancing demo..."):
                         try:
-                            result_df = conn.query(
-                                "CALL RESTAURANT_STREAM_DEMO.PUBLIC.SP_OSTERIA_DEMO_STEP(?)",
-                                params=[demo_loc],
-                                ttl=0
-                            )
-                            msg = str(result_df.iloc[0, 0])
-                            # Extract step number for appropriate icon
+                            with conn.cursor() as cur:
+                                cur.execute("CALL RESTAURANT_STREAM_DEMO.PUBLIC.SP_OSTERIA_DEMO_STEP(%s)", (demo_loc,))
+                                msg = cur.fetchone()[0]
                             if "STEP 1" in msg:
                                 st.toast(msg, icon=":material/receipt_long:")
                             elif "STEP 2" in msg:
