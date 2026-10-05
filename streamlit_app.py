@@ -49,10 +49,15 @@ title_col, live_badge_col = st.columns([3, 1])
 with title_col:
     st.title("Osteria Bella")
     st.caption("Contemporary Italian & Enoteca · AI-Powered Real-Time Floor Operations & Capacity Command")
+
+@st.fragment(run_every="30s")
+def render_live_clock():
+    now = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
+    st.badge(f"Live · {now}", icon=":material/sensors:", color="green")
+
 with live_badge_col:
     st.space("small")
-    pacific_now = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
-    st.badge(f"Live · {pacific_now}", icon=":material/sensors:", color="green")
+    render_live_clock()
 
 # Main Page Filter & Action Ribbon
 with st.container(border=True):
