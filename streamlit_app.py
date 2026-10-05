@@ -579,10 +579,9 @@ st.space("medium")
 # 4. Floor Capacity & Seating Live Streams
 render_capacity_and_stream(selected_location)
 
-# 5. Auto-refresh: full page rerun every 30s (only fires while tab is open)
-if "last_rerun" not in st.session_state:
-    st.session_state["last_rerun"] = time.time()
-
-if time.time() - st.session_state["last_rerun"] > 30:
-    st.session_state["last_rerun"] = time.time()
+# 5. Auto-refresh: triggers a full page rerun every 60s to refresh AI and sales data
+@st.fragment(run_every="60s")
+def auto_refresh_trigger():
     st.rerun()
+
+auto_refresh_trigger()
