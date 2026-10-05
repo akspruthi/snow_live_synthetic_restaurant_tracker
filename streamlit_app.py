@@ -83,7 +83,7 @@ with st.container(border=True):
 st.space("small")
 
 # ----------------- Helper: Cortex AI Action Items Generator (Live LLM Call) -----------------
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=45)
 def generate_ai_operational_directives(location_name, occupancy_pct, seated_count, total_capacity, weather_desc, patio_status, overstay_summary, upcoming_bookings):
     prompt = f"""You are the AI General Manager for Osteria Bella (Contemporary Italian restaurant).
 Analyze this live floor telemetry snapshot:
@@ -105,22 +105,50 @@ Return ONLY valid JSON (no markdown ticks, no commentary) formatted as:
   }}
 ]"""
     try:
-        ai_df = conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT", params=[prompt], ttl=30)
+        ai_df = conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT", params=[prompt], ttl=45)
         raw_text = str(ai_df["AI_OUT"].iloc[0]).strip()
         if raw_text.startswith("```json"): raw_text = raw_text[7:]
         if raw_text.startswith("```"): raw_text = raw_text[3:]
         if raw_text.endswith("```"): raw_text = raw_text[:-3]
         return json.loads(raw_text.strip())
     except Exception as e:
-        return [
-            {
-                "title": f"Floor Pacing for {location_name}",
-                "severity": "WARNING" if occupancy_pct >= 80 else "OPPORTUNITY",
-                "category": "FLOOR",
-                "description": f"Occupancy at {occupancy_pct:.1f}% with {upcoming_bookings} upcoming bookings.",
-                "action": "Ensure table turns remain under 65 minutes and prep host stand for incoming reservations."
-            }
-        ]
+        return None
+
+def get_instant_directives(occupancy_pct, overstay_summary, patio_open, upcoming_bookings):
+    items = []
+    if "Table" in overstay_summary:
+        items.append({
+            "title": "Table Turn Bottleneck Detected",
+            "severity": "WARNING",
+            "category": "FLOOR",
+            "description": f"Overstay detected: {overstay_summary}",
+            "action": "Dispatch floor manager with complimentary digestif to present check and free table."
+        })
+    if not patio_open:
+        items.append({
+            "title": "Weather Alert: Patio Capacity Restricted",
+            "severity": "WARNING",
+            "category": "WEATHER",
+            "description": "Outdoor patio seating closed due to weather (~25 seats unavailable).",
+            "action": "Re-assign outdoor waitlist to indoor high-tops and shift patio servers to bar service."
+        })
+    if occupancy_pct >= 80:
+        items.append({
+            "title": f"High Rush Volume ({occupancy_pct:.1f}%)",
+            "severity": "CRITICAL",
+            "category": "FLOOR",
+            "description": f"Floor occupancy at {occupancy_pct:.1f}% with {upcoming_bookings} upcoming bookings.",
+            "action": "Enforce 90-minute table limits on walk-in 4+ parties and hold bar for waitlist."
+        })
+    else:
+        items.append({
+            "title": f"Capacity Available ({occupancy_pct:.1f}%)",
+            "severity": "OPPORTUNITY",
+            "category": "SALES",
+            "description": f"Ample seating available with {upcoming_bookings} upcoming bookings.",
+            "action": "Quote immediate seating for walk-ins. Spotlight reserve Chianti Classico pairings to lift spend-per-cover."
+        })
+    return items
 
 # ----------------- Section 1: Executive KPI Row & Live Floor Telemetry -----------------
 @st.fragment(run_every="30s")
@@ -228,6 +256,7 @@ def render_ai_section(location_filter):
 
     weather_text = "68°F · Sunny"
     patio_status = "Open"
+    patio_open = True
     if not filtered_weather.empty:
         avg_temp = round(filtered_weather["TEMPERATURE_F"].mean(), 1)
         cond = filtered_weather["CONDITION"].iloc[0] if len(filtered_weather) == 1 else "Clear"
@@ -246,15 +275,39 @@ def render_ai_section(location_filter):
         with ai_head_col:
             st.subheader("🤖 Cortex AI Operator Directives & Action Items")
         with ai_badge_col:
-            st.caption(f"Evaluated: {datetime.now(PACIFIC_TZ).strftime('%I:%M:%S %p PT')}")
+            cache_key_check = f"ai_directives_{location_filter}"
+            is_ai_live = cache_key_check in st.session_state and st.session_state.get(f"ai_source_{location_filter}") == "cortex"
+            if is_ai_live:
+                st.badge("Cortex AI Live", icon=":material/smart_toy:", color="green")
+            else:
+                st.badge("Initializing...", icon=":material/hourglass_top:", color="orange")
+            st.caption(f"{datetime.now(PACIFIC_TZ).strftime('%I:%M:%S %p PT')}")
 
         col_actions, col_quick = st.columns([3, 2])
 
         with col_actions:
-            # Live Cortex AI call with 30s TTL
-            ai_directives = generate_ai_operational_directives(
-                location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
-            )
+            # On first load: show instant rule-based directives (0ms)
+            # On subsequent fragment refreshes (every 45s): call Cortex AI and upgrade
+            cache_key = f"ai_directives_{location_filter}"
+            is_first_load = cache_key not in st.session_state
+
+            if is_first_load:
+                # Instant render — no LLM call, no blocking
+                ai_directives = get_instant_directives(avg_occupancy, overstay_summary, patio_open, upcoming_res)
+                st.session_state[cache_key] = ai_directives
+                st.session_state[f"ai_source_{location_filter}"] = "rules"
+                # Cortex AI will replace these on the next 45s fragment cycle
+            else:
+                # Background refresh: call Cortex AI (cached with 45s TTL)
+                cortex_result = generate_ai_operational_directives(
+                    location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
+                )
+                if cortex_result is not None:
+                    ai_directives = cortex_result
+                    st.session_state[cache_key] = ai_directives
+                    st.session_state[f"ai_source_{location_filter}"] = "cortex"
+                else:
+                    ai_directives = st.session_state[cache_key]
 
             color_map = {
                 "CRITICAL": ("#E53E3E", "#FC8181", "rgba(229,62,62,0.25)", "#FEB2B2", "🔴 Critical"),
