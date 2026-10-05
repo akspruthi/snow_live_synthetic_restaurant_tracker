@@ -218,13 +218,10 @@ def render_kpi_row(location_filter):
         st.metric("Bookings / Waitlist", f"{upcoming_res} / {waitlist_count}", border=True)
         st.metric("Weather & Patio", weather_text, patio_status, delta_color="normal" if "Open" in patio_status else "inverse", border=True)
 
-# ----------------- Section 2: AI Directives (Instant Rule Engine + On-Demand Cortex AI) -----------------
+# ----------------- Section 2: AI Directives (Always Instant from Session State) -----------------
 def render_ai_section(location_filter):
-    cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
-    cap_df = conn.query(cap_query, ttl=5)
-
-    weather_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER"
-    weather_df = conn.query(weather_query, ttl=10)
+    cap_df = conn.query("SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY", ttl=5)
+    weather_df = conn.query("SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER", ttl=10)
 
     res_where = ""
     res_params = []
@@ -232,13 +229,10 @@ def render_ai_section(location_filter):
         res_where = "WHERE LOCATION_NAME = ?"
         res_params.append(location_filter)
 
-    res_query = f"""
-        SELECT 
-            TABLE_NUMBER, GUEST_NAME, PARTY_SIZE, STATUS, EST_DURATION_MINS, CURRENT_CHECK_TOTAL
-        FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS
-        {res_where}
-    """
-    res_df = conn.query(res_query, params=res_params if res_params else None, ttl=5)
+    res_df = conn.query(f"""
+        SELECT TABLE_NUMBER, GUEST_NAME, PARTY_SIZE, STATUS, EST_DURATION_MINS, CURRENT_CHECK_TOTAL
+        FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS {res_where}
+    """, params=res_params if res_params else None, ttl=5)
 
     filtered_cap = cap_df.copy() if not cap_df.empty else pd.DataFrame()
     if location_filter != "All Locations" and not filtered_cap.empty:
@@ -253,15 +247,9 @@ def render_ai_section(location_filter):
     if location_filter != "All Locations" and not filtered_weather.empty:
         filtered_weather = filtered_weather[filtered_weather["LOCATION_NAME"] == location_filter]
 
-    weather_text = "68°F · Sunny"
-    patio_status = "Open"
     patio_open = True
     if not filtered_weather.empty:
-        avg_temp = round(filtered_weather["TEMPERATURE_F"].mean(), 1)
-        cond = filtered_weather["CONDITION"].iloc[0] if len(filtered_weather) == 1 else "Clear"
         patio_open = all(filtered_weather["PATIO_OPEN"])
-        patio_status = "Patio Open" if patio_open else "⚠️ Patio Closed"
-        weather_text = f"{avg_temp}°F · {cond}"
 
     overstay_df = res_df[(res_df["STATUS"] == "SEATED") & (res_df["EST_DURATION_MINS"] >= 85)] if not res_df.empty else pd.DataFrame()
     overstay_summary = "None currently"
@@ -269,42 +257,22 @@ def render_ai_section(location_filter):
         overstay_items = [f"Table {r['TABLE_NUMBER']} ({r['GUEST_NAME']}, party of {r['PARTY_SIZE']}) at {r['EST_DURATION_MINS']}m (tab ${r['CURRENT_CHECK_TOTAL']:.0f})" for _, r in overstay_df.head(2).iterrows()]
         overstay_summary = "; ".join(overstay_items)
 
-    with st.container(border=True):
-        ai_source = st.session_state.get(f"ai_source_{location_filter}", "rules")
+    # Seed instant rule-based directives on first load
+    cache_key = f"ai_directives_{location_filter}"
+    if cache_key not in st.session_state:
+        st.session_state[cache_key] = get_instant_directives(avg_occupancy, overstay_summary, patio_open, upcoming_res)
+        st.session_state[f"ai_source_{location_filter}"] = "rules"
 
-        # Prominent status banner
+    ai_source = st.session_state.get(f"ai_source_{location_filter}", "rules")
+    ai_directives = st.session_state[cache_key]
+
+    with st.container(border=True):
         if ai_source == "cortex":
             st.success("**Cortex AI (llama3.1-70b)** is actively analyzing your live floor telemetry.", icon=":material/smart_toy:")
         else:
-            st.info("**Rules Engine** is providing instant operational directives. Click below to upgrade to Cortex AI analysis.", icon=":material/bolt:")
+            st.warning("**Cortex AI (llama3.1-70b)** is analyzing your live floor telemetry — results arriving shortly...", icon=":material/hourglass_top:")
 
-        ai_head_col, ai_btn_col = st.columns([3, 2], vertical_alignment="bottom")
-        with ai_head_col:
-            st.subheader("🤖 Operator Directives & Action Items")
-        with ai_btn_col:
-            ai_clicked = st.button(
-                "🧠 Analyze with Cortex AI" if ai_source != "cortex" else "🧠 Re-Analyze with Cortex AI",
-                icon=":material/smart_toy:", 
-                use_container_width=True
-            )
-
-        # Always start with instant rule-based directives
-        cache_key = f"ai_directives_{location_filter}"
-        if cache_key not in st.session_state:
-            st.session_state[cache_key] = get_instant_directives(avg_occupancy, overstay_summary, patio_open, upcoming_res)
-            st.session_state[f"ai_source_{location_filter}"] = "rules"
-
-        # If user clicked the AI button, call Cortex AI now (blocks only this section)
-        if ai_clicked:
-            with st.spinner("Cortex AI analyzing live floor telemetry..."):
-                cortex_result = generate_ai_operational_directives(
-                    location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
-                )
-                if cortex_result is not None:
-                    st.session_state[cache_key] = cortex_result
-                    st.session_state[f"ai_source_{location_filter}"] = "cortex"
-
-        ai_directives = st.session_state[cache_key]
+        st.subheader("🤖 Operator Directives & Action Items")
 
         col_actions, col_quick = st.columns([3, 2])
 
@@ -613,7 +581,7 @@ def render_capacity_and_stream(location_filter):
 render_kpi_row(selected_location)
 st.space("medium")
 
-# 2. Live Cortex AI Action Items & Directives
+# 2. AI Directives (instant from session state — never blocks)
 render_ai_section(selected_location)
 st.space("medium")
 
@@ -623,3 +591,47 @@ st.space("medium")
 
 # 4. Floor Capacity & Seating Live Streams
 render_capacity_and_stream(selected_location)
+
+# 5. Background Cortex AI Upgrade (runs AFTER all UI is rendered)
+#    On the very first load, session state has "rules". This block calls Cortex AI
+#    after the full page is visible, stores the result, and reruns once to upgrade.
+ai_cache_key = f"ai_directives_{selected_location}"
+ai_source_key = f"ai_source_{selected_location}"
+if st.session_state.get(ai_source_key) != "cortex":
+    # Collect telemetry for the AI prompt
+    _cap = conn.query("SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY", ttl=5)
+    _weather = conn.query("SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER", ttl=10)
+    _res_where = ""
+    _res_params = []
+    if selected_location != "All Locations":
+        _res_where = "WHERE LOCATION_NAME = ?"
+        _res_params.append(selected_location)
+    _res = conn.query(f"SELECT TABLE_NUMBER, GUEST_NAME, PARTY_SIZE, STATUS, EST_DURATION_MINS, CURRENT_CHECK_TOTAL FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS {_res_where}", params=_res_params if _res_params else None, ttl=5)
+
+    _fc = _cap.copy() if not _cap.empty else pd.DataFrame()
+    if selected_location != "All Locations" and not _fc.empty:
+        _fc = _fc[_fc["LOCATION_NAME"] == selected_location]
+    _ts = int(_fc["MAX_SEATS"].sum()) if not _fc.empty else 0
+    _sg = int(_fc["CURRENT_GUESTS_SEATED"].sum()) if not _fc.empty else 0
+    _ur = int(_fc["UPCOMING_RESERVATIONS"].sum()) if not _fc.empty else 0
+    _occ = round((_sg / _ts * 100), 1) if _ts > 0 else 0.0
+
+    _fw = _weather.copy() if not _weather.empty else pd.DataFrame()
+    if selected_location != "All Locations" and not _fw.empty:
+        _fw = _fw[_fw["LOCATION_NAME"] == selected_location]
+    _wt = "68°F · Sunny"
+    _ps = "Open"
+    if not _fw.empty:
+        _wt = f"{round(_fw['TEMPERATURE_F'].mean(), 1)}°F · {_fw['CONDITION'].iloc[0]}"
+        _ps = "Patio Open" if all(_fw["PATIO_OPEN"]) else "Patio Closed"
+
+    _ov = _res[(_res["STATUS"] == "SEATED") & (_res["EST_DURATION_MINS"] >= 85)] if not _res.empty else pd.DataFrame()
+    _os = "None currently"
+    if not _ov.empty:
+        _os = "; ".join([f"Table {r['TABLE_NUMBER']} ({r['GUEST_NAME']}, party of {r['PARTY_SIZE']}) at {r['EST_DURATION_MINS']}m" for _, r in _ov.head(2).iterrows()])
+
+    cortex_result = generate_ai_operational_directives(selected_location, _occ, _sg, _ts, _wt, _ps, _os, _ur)
+    if cortex_result is not None:
+        st.session_state[ai_cache_key] = cortex_result
+        st.session_state[ai_source_key] = "cortex"
+        st.rerun()
