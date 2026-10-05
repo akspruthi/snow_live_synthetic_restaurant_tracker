@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import time
 import streamlit as st
 import pandas as pd
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 from streamlit_autorefresh import st_autorefresh
 
 PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
+AI_MIN_INTERVAL_SECS = 120
 
 st.set_page_config(
     page_title="Osteria Bella — AI Restaurant Operations Command",
@@ -23,7 +25,6 @@ conn = st.connection("snowflake", ttl=os.getenv("SNOWFLAKE_CONNECTION_TTL"))
 # Custom luxury styling enhancements
 st.markdown("""
 <style>
-    /* Metric Card Styling */
     div[data-testid="stMetric"] {
         background-color: #171F2C;
         border: 1px solid rgba(212, 175, 55, 0.2);
@@ -31,16 +32,25 @@ st.markdown("""
         padding: 12px 16px;
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
     }
-
-    /* Action Cards */
     .action-card {
         border-radius: 8px;
-        padding: 14px 18px;
-        margin-bottom: 12px;
+        padding: 12px 16px;
+        margin-bottom: 10px;
         background: #171F2C;
         border-top: 1px solid rgba(255, 255, 255, 0.05);
         border-right: 1px solid rgba(255, 255, 255, 0.05);
         border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .weather-inline {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 0.85em;
+        color: #94A3B8;
+        background: #171F2C;
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 6px;
+        padding: 4px 12px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -49,7 +59,7 @@ st.markdown("""
 title_col, live_badge_col = st.columns([3, 1])
 with title_col:
     st.title("Osteria Bella")
-    st.caption("Contemporary Italian & Enoteca · AI-Powered Real-Time Floor Operations & Capacity Command")
+    st.caption("Contemporary Italian & Enoteca · AI-Powered Real-Time Floor Operations")
 
 with live_badge_col:
     st.space("small")
@@ -62,9 +72,9 @@ with st.container(border=True):
 
     locations_df = conn.query("SELECT LOCATION_NAME FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_LOCATIONS ORDER BY 1", ttl=60)
     all_locations = ["All Locations"] + (locations_df["LOCATION_NAME"].tolist() if not locations_df.empty else [])
-    
+
     with col_store:
-        selected_location = st.selectbox("📍 Store Location Filter", all_locations, key="top_store")
+        selected_location = st.selectbox("Store Location Filter", all_locations, key="top_store")
 
     with col_simulate:
         if st.button("Simulate Floor Shifts", icon=":material/autorenew:", use_container_width=True):
@@ -74,6 +84,8 @@ with st.container(border=True):
                         cur.execute("CALL RESTAURANT_STREAM_DEMO.PUBLIC.SP_GENERATE_OSTERIA_TELEMETRY()")
                     st.toast("Floor telemetry updated with live variance!", icon=":material/check_circle:")
                     st.cache_data.clear()
+                    if "_ai_cache" in st.session_state:
+                        del st.session_state["_ai_cache"]
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -83,48 +95,96 @@ with st.container(border=True):
             st.cache_data.clear()
             st.rerun()
 
-st.space("small")
+# Track location changes for loading indicator
+_prev_loc = st.session_state.get("_prev_location", selected_location)
+_location_changed = _prev_loc != selected_location
+st.session_state["_prev_location"] = selected_location
 
-# ----------------- Helper: Cortex AI Action Items Generator (Live LLM Call) -----------------
-@st.cache_data(ttl=30)
-def generate_ai_operational_directives(location_name, occupancy_pct, seated_count, total_capacity, weather_desc, patio_status, overstay_summary, upcoming_bookings):
-    prompt = f"""You are the AI General Manager for Osteria Bella (Contemporary Italian restaurant).
-Analyze this live floor telemetry snapshot:
+
+# ----------------- Helper: Cortex AI Suggested Actions (session_state cached) -----------------
+def _ai_inputs_hash(location, occupancy, seated, capacity, weather, patio, overstay, bookings):
+    raw = f"{location}|{occupancy:.0f}|{seated}|{capacity}|{weather}|{patio}|{overstay}|{bookings}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _call_cortex_ai(location_name, occupancy_pct, seated_count, total_capacity, weather_desc, patio_status, overstay_summary, upcoming_bookings):
+    prompt = f"""You are an operations analyst for Osteria Bella restaurant.
+Review this live floor data and return 2-3 suggested actions as JSON.
+
+DATA SNAPSHOT:
 - Location: {location_name}
 - Floor Occupancy: {occupancy_pct:.1f}% ({seated_count} seated / {total_capacity} total seats)
 - Weather & Patio: {weather_desc} ({patio_status})
 - Upcoming Bookings / Waitlist: {upcoming_bookings} parties
-- Key Overstay Bottlenecks: {overstay_summary}
+- Long-seated tables: {overstay_summary}
 
-Generate a JSON list of 2 to 3 concise, tactical operational action items for the floor manager or chef right now.
-Return ONLY valid JSON (no markdown ticks, no commentary) formatted as:
+RULES — follow strictly:
+1. Each suggestion MUST reference the specific location name and any relevant table numbers from the data.
+2. Include supporting facts (numbers, percentages, counts) from the data above in every suggestion.
+3. Focus ONLY on: service checks, seating readiness, upcoming arrival preparation, and items needing manager review.
+4. NEVER suggest rushing guests, offering complimentary items, giving discounts, or serving alcohol.
+5. Use ONLY facts present in the data. Do not invent or assume information.
+
+Return ONLY valid JSON (no markdown, no commentary):
 [
   {{
-    "title": "Short title",
-    "severity": "CRITICAL" or "WARNING" or "OPPORTUNITY" or "SUCCESS",
-    "category": "FLOOR" or "WEATHER" or "KITCHEN",
-    "description": "Specific context with numbers/parties",
-    "action": "Concrete directive for the manager"
+    "title": "Short action title",
+    "severity": "CRITICAL" or "WARNING" or "INFO" or "OK",
+    "location": "{location_name}",
+    "table_ref": "Table number(s) or 'N/A'",
+    "facts": "Key data points supporting this action",
+    "action": "Specific next step for the manager"
   }}
 ]"""
     try:
-        ai_df = conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT", params=[prompt], ttl=45)
+        ai_df = conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT", params=[prompt], ttl=600)
         raw_text = str(ai_df["AI_OUT"].iloc[0]).strip()
-        if raw_text.startswith("```json"): raw_text = raw_text[7:]
-        if raw_text.startswith("```"): raw_text = raw_text[3:]
-        if raw_text.endswith("```"): raw_text = raw_text[:-3]
-        analyzed_at = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
-        return json.loads(raw_text.strip()), analyzed_at
-    except Exception as e:
-        return None, datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        if raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+        return json.loads(raw_text.strip())
+    except Exception:
+        return None
 
-# ----------------- Section 1: Executive KPI Row & Live Floor Telemetry -----------------
+
+def get_ai_suggestions(location, occupancy, seated, capacity, weather, patio, overstay, bookings, force=False):
+    current_hash = _ai_inputs_hash(location, occupancy, seated, capacity, weather, patio, overstay, bookings)
+    cache = st.session_state.get("_ai_cache", None)
+    now_ts = time.time()
+
+    if not force and cache is not None:
+        elapsed = now_ts - cache["timestamp"]
+        if cache["inputs_hash"] == current_hash:
+            return cache["directives"], cache["analyzed_at"]
+        if elapsed < AI_MIN_INTERVAL_SECS:
+            return cache["directives"], cache["analyzed_at"]
+
+    directives = _call_cortex_ai(location, occupancy, seated, capacity, weather, patio, overstay, bookings)
+    analyzed_at = datetime.now(PACIFIC_TZ).strftime("%I:%M:%S %p PT")
+    st.session_state["_ai_cache"] = {
+        "directives": directives,
+        "analyzed_at": analyzed_at,
+        "inputs_hash": current_hash,
+        "timestamp": now_ts,
+    }
+    return directives, analyzed_at
+
+
+# ----------------- Section: Executive KPI Row -----------------
 def render_kpi_row(location_filter):
-    cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
-    cap_df = conn.query(cap_query, ttl=5)
+    if _location_changed:
+        with st.spinner("Loading metrics..."):
+            _render_kpi_row_inner(location_filter)
+    else:
+        _render_kpi_row_inner(location_filter)
 
-    weather_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER"
-    weather_df = conn.query(weather_query, ttl=10)
+
+def _render_kpi_row_inner(location_filter):
+    cap_df = conn.query("SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY", ttl=5)
+    weather_df = conn.query("SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER", ttl=10)
 
     res_where = ""
     res_params = []
@@ -132,13 +192,10 @@ def render_kpi_row(location_filter):
         res_where = "WHERE LOCATION_NAME = ?"
         res_params.append(location_filter)
 
-    res_query = f"""
-        SELECT 
-            STATUS, EST_DURATION_MINS
-        FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS
-        {res_where}
-    """
-    res_df = conn.query(res_query, params=res_params if res_params else None, ttl=5)
+    res_df = conn.query(f"""
+        SELECT STATUS, EST_DURATION_MINS
+        FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS {res_where}
+    """, params=res_params if res_params else None, ttl=5)
 
     filtered_cap = cap_df.copy() if not cap_df.empty else pd.DataFrame()
     if location_filter != "All Locations" and not filtered_cap.empty:
@@ -150,7 +207,7 @@ def render_kpi_row(location_filter):
     upcoming_res = int(filtered_cap["UPCOMING_RESERVATIONS"].sum()) if not filtered_cap.empty else 0
     waitlist_count = int(filtered_cap["WAITLIST_COUNT"].sum()) if not filtered_cap.empty else 0
     live_floor_sales = float(filtered_cap["LIVE_FLOOR_REVENUE"].sum()) if not filtered_cap.empty else 0.0
-    
+
     avg_occupancy = round((seated_guests / total_seats * 100), 1) if total_seats > 0 else 0.0
 
     operating_hours = 6.0
@@ -174,19 +231,31 @@ def render_kpi_row(location_filter):
         avg_temp = round(filtered_weather["TEMPERATURE_F"].mean(), 1)
         cond = filtered_weather["CONDITION"].iloc[0] if len(filtered_weather) == 1 else "Clear"
         patio_open = all(filtered_weather["PATIO_OPEN"])
-        patio_status = "Patio Open" if patio_open else "⚠️ Patio Closed"
+        patio_status = "Patio Open" if patio_open else "Patio Closed"
         weather_text = f"{avg_temp}°F · {cond}"
 
+    # Compact weather inline below KPIs
     with st.container(horizontal=True):
         st.metric("Live Floor Sales", f"${live_floor_sales:,.2f}", f"{active_tables} tables active", border=True)
         st.metric("Floor Occupancy", f"{seated_guests} / {total_seats} seats", f"{avg_occupancy:.1f}% occupied", border=True)
-        st.metric("Avg Table Turn Time", f"{avg_turn_mins} mins", turn_delta_str, delta_color="inverse", border=True)
+        st.metric("Avg Turn Time", f"{avg_turn_mins} min", turn_delta_str, delta_color="inverse", border=True)
         st.metric("RevPASH ($/Seat-Hr)", f"${revpash:.2f}", revpash_delta_str, border=True)
         st.metric("Bookings / Waitlist", f"{upcoming_res} / {waitlist_count}", border=True)
-        st.metric("Weather & Patio", weather_text, patio_status, delta_color="normal" if "Open" in patio_status else "inverse", border=True)
 
-# ----------------- Section 2: AI Directives (Simple Direct Cortex AI Call) -----------------
+    patio_icon = ":material/wb_sunny:" if "Open" in patio_status else ":material/cloud:"
+    st.caption(f"{patio_icon} {weather_text} · {patio_status}")
+
+
+# ----------------- Section: Suggested Actions (AI) -----------------
 def render_ai_section(location_filter):
+    if _location_changed:
+        with st.spinner("Loading AI suggestions..."):
+            _render_ai_section_inner(location_filter)
+    else:
+        _render_ai_section_inner(location_filter)
+
+
+def _render_ai_section_inner(location_filter):
     cap_df = conn.query("SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY", ttl=5)
     weather_df = conn.query("SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_WEATHER", ttl=10)
 
@@ -226,89 +295,104 @@ def render_ai_section(location_filter):
     overstay_df = res_df[(res_df["STATUS"] == "SEATED") & (res_df["EST_DURATION_MINS"] >= 85)] if not res_df.empty else pd.DataFrame()
     overstay_summary = "None currently"
     if not overstay_df.empty:
-        overstay_items = [f"Table {r['TABLE_NUMBER']} ({r['GUEST_NAME']}, party of {r['PARTY_SIZE']}) at {r['EST_DURATION_MINS']}m (tab ${r['CURRENT_CHECK_TOTAL']:.0f})" for _, r in overstay_df.head(2).iterrows()]
+        overstay_items = [f"Table {r['TABLE_NUMBER']} ({r['GUEST_NAME']}, party of {r['PARTY_SIZE']}) at {r['EST_DURATION_MINS']}m" for _, r in overstay_df.head(3).iterrows()]
         overstay_summary = "; ".join(overstay_items)
 
+    force_reanalyze = st.session_state.pop("_ai_force_reanalyze", False)
+
+    ai_directives, analyzed_at = get_ai_suggestions(
+        location_filter, avg_occupancy, seated_guests, total_seats,
+        weather_text, patio_status, overstay_summary, upcoming_res,
+        force=force_reanalyze
+    )
+
     with st.container(border=True):
-        ai_header_col, ai_action_col = st.columns([3, 2], vertical_alignment="bottom")
-        with ai_header_col:
-            st.subheader("🤖 Operator Directives & Action Items")
-        with ai_action_col:
+        hdr_col, time_col, btn_col = st.columns([2.5, 2, 1.5], vertical_alignment="bottom")
+        with hdr_col:
+            st.subheader("Suggested Actions", anchor=False)
+        with time_col:
+            st.caption(f":material/smart_toy: Cortex AI · Analyzed {analyzed_at}")
+        with btn_col:
             if st.button("Re-Analyze Now", icon=":material/smart_toy:", use_container_width=True):
-                generate_ai_operational_directives.clear()
+                st.session_state["_ai_force_reanalyze"] = True
                 st.rerun()
+
+        if ai_directives is None:
+            st.info("Cortex AI returned no results. Click Re-Analyze Now to retry.")
+            ai_directives = []
+
+        color_map = {
+            "CRITICAL": ("#E53E3E", "#FC8181", "rgba(229,62,62,0.25)", "#FEB2B2", "Critical"),
+            "WARNING": ("#DD6B20", "#FBD38D", "rgba(221,107,32,0.25)", "#FEEBC8", "Warning"),
+            "INFO": ("#3182CE", "#63B3ED", "rgba(49,130,206,0.25)", "#BEE3F8", "Info"),
+            "OK": ("#38A169", "#68D391", "rgba(56,161,105,0.25)", "#C6F6D5", "OK"),
+            "OPPORTUNITY": ("#3182CE", "#63B3ED", "rgba(49,130,206,0.25)", "#BEE3F8", "Info"),
+            "SUCCESS": ("#38A169", "#68D391", "rgba(56,161,105,0.25)", "#C6F6D5", "OK"),
+        }
 
         col_actions, col_quick = st.columns([3, 2])
 
         with col_actions:
-            ai_directives, analyzed_at = generate_ai_operational_directives(
-                location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
-            )
-
-            st.success(f"**Cortex AI (llama3.1-70b)** · Last analyzed: {analyzed_at} · Refreshes every 30s", icon=":material/smart_toy:")
-
-            if ai_directives is None:
-                st.caption("Cortex AI returned no results. Retrying on next refresh cycle.")
-                ai_directives = []
-
-            color_map = {
-                "CRITICAL": ("#E53E3E", "#FC8181", "rgba(229,62,62,0.25)", "#FEB2B2", "🔴 Critical"),
-                "WARNING": ("#DD6B20", "#FBD38D", "rgba(221,107,32,0.25)", "#FEEBC8", "🟠 Warning"),
-                "OPPORTUNITY": ("#3182CE", "#63B3ED", "rgba(49,130,206,0.25)", "#BEE3F8", "🔵 Opportunity"),
-                "SUCCESS": ("#38A169", "#68D391", "rgba(56,161,105,0.25)", "#C6F6D5", "🟢 Efficient")
-            }
-
             for item in ai_directives:
                 sev = item.get("severity", "WARNING").upper()
-                border_col, title_col, badge_bg, badge_fg, badge_label = color_map.get(sev, color_map["WARNING"])
-                
+                border_col, title_col_c, badge_bg, badge_fg, badge_label = color_map.get(sev, color_map["WARNING"])
+                loc_ref = item.get("location", "")
+                table_ref = item.get("table_ref", "")
+                facts = item.get("facts", "")
+                meta_parts = []
+                if loc_ref:
+                    meta_parts.append(loc_ref)
+                if table_ref and table_ref != "N/A":
+                    meta_parts.append(f"Table {table_ref}")
+                meta_line = " · ".join(meta_parts)
+
                 st.markdown(f"""
                 <div class="action-card" style="border-left: 4px solid {border_col};">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-                        <strong style="color: {title_col}; font-size: 1.05em;">{item.get('title', 'Operational Item')}</strong>
-                        <span style="font-size: 0.8em; background: {badge_bg}; color: {badge_fg}; padding: 2px 8px; border-radius: 4px; font-weight: bold;">{badge_label}</span>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px;">
+                        <strong style="color: {title_col_c}; font-size: 1em;">{item.get('title', 'Action Item')}</strong>
+                        <span style="font-size: 0.75em; background: {badge_bg}; color: {badge_fg}; padding: 2px 8px; border-radius: 4px; font-weight: bold;">{badge_label}</span>
                     </div>
-                    <div style="font-size: 0.9em; color: #CBD5E0; line-height: 1.4; margin-bottom: 6px;">
-                        {item.get('description', '')}
-                    </div>
-                    <div style="font-size: 0.9em; color: #F1F5F9; line-height: 1.4; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 6px;">
+                    {"<div style='font-size:0.8em;color:#94A3B8;margin-bottom:3px;'>" + meta_line + "</div>" if meta_line else ""}
+                    {"<div style='font-size:0.82em;color:#CBD5E0;margin-bottom:4px;'>" + facts + "</div>" if facts else ""}
+                    <div style="font-size: 0.88em; color: #F1F5F9; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 5px;">
                         <strong>Action:</strong> {item.get('action', '')}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
 
         with col_quick:
-            st.markdown("**Live Walk-In Quotes & Floor Throttle**")
+            st.markdown("**Walk-In Wait Estimates**")
             wait_2top = 0 if avg_occupancy < 50 else (15 if avg_occupancy < 80 else 30)
             wait_4top = 5 if avg_occupancy < 50 else (25 if avg_occupancy < 80 else 50)
             wait_6top = 15 if avg_occupancy < 50 else (40 if avg_occupancy < 80 else 75)
 
             with st.container(horizontal=True):
-                st.metric("2-Top Walk-In", f"{wait_2top} min" if wait_2top > 0 else "Immediate", border=True)
-                st.metric("4-Top Walk-In", f"{wait_4top} min" if wait_4top > 0 else "Immediate", border=True)
-                st.metric("6+ Group", f"{wait_6top} min", border=True)
+                st.metric("2-Top", f"{wait_2top} min" if wait_2top > 0 else "Immediate", border=True)
+                st.metric("4-Top", f"{wait_4top} min" if wait_4top > 0 else "Immediate", border=True)
+                st.metric("6+ Party", f"{wait_6top} min", border=True)
 
             st.space("small")
-            st.markdown("**Quick Operator Actions**")
+            st.markdown("**Quick Actions**")
             col_b1, col_b2 = st.columns(2)
             with col_b1:
-                if st.button("Send Limoncello Reset", use_container_width=True, icon=":material/local_bar:"):
-                    st.toast("Floor alert dispatched: Complimentary digestif sent to wrap table.", icon=":material/check:")
+                if st.button("Flag for Manager", use_container_width=True, icon=":material/flag:"):
+                    st.toast("Manager review flagged for current floor state.", icon=":material/check:")
             with col_b2:
                 if st.button("Hold Bar Seating", use_container_width=True, icon=":material/lock:"):
                     st.toast("Host stand updated: Bar counter restricted to waitlist guests.", icon=":material/check:")
 
-# ----------------- Section 3: Sales Analysis & YoY Performance -----------------
+
+# ----------------- Section: Sales Analysis & YoY Performance -----------------
 def render_sales_section(location_filter):
     with st.container(border=True):
         col_stitle, col_sfilter = st.columns([3, 2], vertical_alignment="center")
         with col_stitle:
-            st.subheader("📈 Sales Pacing & Year-over-Year (YoY) Performance")
+            st.subheader("Sales Pacing & YoY Performance")
         with col_sfilter:
             time_period = st.segmented_control(
-                "Time Window", 
-                ["Today (Hourly)", "Last 7 Days (YoY)", "Last 30 Days (YoY)", "Last 90 Days (YoY)"], 
-                default="Last 7 Days (YoY)", 
+                "Time Window",
+                ["Today (Hourly)", "Last 7 Days (YoY)", "Last 30 Days (YoY)", "Last 90 Days (YoY)"],
+                default="Last 7 Days (YoY)",
                 label_visibility="collapsed"
             )
 
@@ -330,7 +414,7 @@ def render_sales_section(location_filter):
             sales_where_clauses.append("SALE_DATE >= DATEADD('day', -30, CURRENT_DATE())")
             group_col = "SALE_DATE"
             group_label = "Date"
-        else: # Last 90 Days
+        else:
             sales_where_clauses.append("SALE_DATE >= DATEADD('day', -90, CURRENT_DATE())")
             group_col = "SALE_DATE"
             group_label = "Date"
@@ -338,7 +422,7 @@ def render_sales_section(location_filter):
         sales_where_sql = ("WHERE " + " AND ".join(sales_where_clauses)) if sales_where_clauses else ""
 
         history_sql = f"""
-            SELECT 
+            SELECT
                 {group_col} AS TIME_BUCKET,
                 SUM(NET_SALES) AS CURRENT_SALES,
                 SUM(PRIOR_YEAR_SALES) AS PRIOR_YEAR_SALES,
@@ -352,7 +436,7 @@ def render_sales_section(location_filter):
         sales_history_df = conn.query(history_sql, params=sales_params if sales_params else None, ttl=30)
 
         cat_sql = f"""
-            SELECT 
+            SELECT
                 CATEGORY,
                 SUM(NET_SALES) AS TOTAL_CATEGORY_SALES
             FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_SALES_HISTORY
@@ -382,9 +466,9 @@ def render_sales_section(location_filter):
                 st.markdown(f"**Net Revenue vs. Prior Year** — {growth_badge} (${tot_curr:,.0f} vs ${tot_prior:,.0f})")
 
                 melted = sales_history_df.melt(
-                    id_vars=["TIME_BUCKET"], 
+                    id_vars=["TIME_BUCKET"],
                     value_vars=["CURRENT_SALES", "PRIOR_YEAR_SALES"],
-                    var_name="PERIOD", 
+                    var_name="PERIOD",
                     value_name="SALES"
                 )
                 melted["PERIOD"] = melted["PERIOD"].map({"CURRENT_SALES": "Current Period", "PRIOR_YEAR_SALES": "Prior Year (YoY)"})
@@ -416,10 +500,9 @@ def render_sales_section(location_filter):
             else:
                 st.info("No category data.")
 
-# ----------------- Section 4: Floor Capacity & Seating Sections -----------------
+# ----------------- Section: Floor Capacity & Seating -----------------
 def render_capacity_and_stream(location_filter):
-    cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
-    cap_df = conn.query(cap_query, ttl=5)
+    cap_df = conn.query("SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY", ttl=5)
 
     res_where = ""
     res_params = []
@@ -428,13 +511,13 @@ def render_capacity_and_stream(location_filter):
         res_params.append(location_filter)
 
     res_query = f"""
-        SELECT 
-            RESERVATION_ID, LOCATION_NAME, GUEST_NAME, PARTY_SIZE, TABLE_NUMBER, 
-            STATUS, SEATING_AREA, RESERVATION_TIME, SEATED_AT, EST_DURATION_MINS, 
+        SELECT
+            RESERVATION_ID, LOCATION_NAME, GUEST_NAME, PARTY_SIZE, TABLE_NUMBER,
+            STATUS, SEATING_AREA, RESERVATION_TIME, SEATED_AT, EST_DURATION_MINS,
             VIP_TIER, DIETARY_NOTES, CURRENT_CHECK_TOTAL
         FROM RESTAURANT_STREAM_DEMO.PUBLIC.OSTERIA_RESERVATIONS
         {res_where}
-        ORDER BY 
+        ORDER BY
             CASE STATUS WHEN 'SEATED' THEN 1 WHEN 'WAITLIST' THEN 2 ELSE 3 END,
             RESERVATION_TIME DESC
     """
@@ -445,19 +528,19 @@ def render_capacity_and_stream(location_filter):
         filtered_cap = filtered_cap[filtered_cap["LOCATION_NAME"] == location_filter]
 
     with st.container(border=True):
-        st.subheader("🪑 Location Capacity & Live Table Turnover")
+        st.subheader("Location Capacity & Table Turnover")
 
         if not filtered_cap.empty:
             cap_chart_df = filtered_cap.copy()
-            
+
             cap_chart_df["CALC_OCCUPANCY_PCT"] = cap_chart_df.apply(
                 lambda r: round((float(r["CURRENT_GUESTS_SEATED"]) / float(r["MAX_SEATS"]) * 100.0), 1) if float(r["MAX_SEATS"]) > 0 else 0.0,
                 axis=1
             )
             cap_chart_df["LABEL_TEXT"] = cap_chart_df.apply(
-                lambda r: f" {int(r['CURRENT_GUESTS_SEATED'])}/{int(r['MAX_SEATS'])} seats ({r['CALC_OCCUPANCY_PCT']:.1f}%)", axis=1
+                lambda r: f" {int(r['CURRENT_GUESTS_SEATED'])}/{int(r['MAX_SEATS'])} ({r['CALC_OCCUPANCY_PCT']:.0f}%)", axis=1
             )
-            
+
             def calc_color(val):
                 if val >= 80: return "#E53E3E"
                 if val >= 50: return "#DD6B20"
@@ -470,7 +553,7 @@ def render_capacity_and_stream(location_filter):
                 bar_chart = alt.Chart(cap_chart_df).mark_bar(cornerRadius=4).encode(
                     x=alt.X(
                         "CALC_OCCUPANCY_PCT:Q",
-                        title="Occupancy % (0% to 100% capacity)",
+                        title="Occupancy %",
                         scale=alt.Scale(domain=[0, 100]),
                         axis=alt.Axis(values=[0, 20, 40, 60, 80, 100], format="d")
                     ),
@@ -478,20 +561,16 @@ def render_capacity_and_stream(location_filter):
                     color=alt.Color("HEX_COLOR:N", scale=None, legend=None),
                     tooltip=[
                         alt.Tooltip("LOCATION_NAME:N", title="Store"),
-                        alt.Tooltip("CURRENT_GUESTS_SEATED:Q", title="Seated Guests"),
-                        alt.Tooltip("MAX_SEATS:Q", title="Max Capacity"),
+                        alt.Tooltip("CURRENT_GUESTS_SEATED:Q", title="Seated"),
+                        alt.Tooltip("MAX_SEATS:Q", title="Capacity"),
                         alt.Tooltip("CALC_OCCUPANCY_PCT:Q", title="Occupancy %", format=".1f"),
                         alt.Tooltip("UPCOMING_RESERVATIONS:Q", title="Bookings")
                     ]
                 )
 
                 text_labels = alt.Chart(cap_chart_df).mark_text(
-                    align="left",
-                    baseline="middle",
-                    dx=6,
-                    color="#F1F5F9",
-                    fontSize=11,
-                    fontWeight="bold"
+                    align="left", baseline="middle", dx=6,
+                    color="#F1F5F9", fontSize=11, fontWeight="bold"
                 ).encode(
                     x=alt.X("CALC_OCCUPANCY_PCT:Q"),
                     y=alt.Y("LOCATION_NAME:N", sort="-x"),
@@ -508,25 +587,23 @@ def render_capacity_and_stream(location_filter):
                 st.dataframe(
                     display_cap,
                     column_config={
-                        "LOCATION_NAME": "Store Location",
+                        "LOCATION_NAME": "Location",
                         "CURRENT_GUESTS_SEATED": st.column_config.NumberColumn("Seated", format="%d"),
                         "MAX_SEATS": st.column_config.NumberColumn("Capacity", format="%d"),
-                        "OCCUPANCY_PCT_DISPLAY": "Occupancy",
-                        "UPCOMING_RESERVATIONS": st.column_config.NumberColumn("Reservations", format="%d"),
+                        "OCCUPANCY_PCT_DISPLAY": "Occ %",
+                        "UPCOMING_RESERVATIONS": st.column_config.NumberColumn("Bookings", format="%d"),
                         "WAITLIST_COUNT": st.column_config.NumberColumn("Waitlist", format="%d"),
                     },
                     use_container_width=True,
                     hide_index=True
                 )
 
-    st.space("medium")
-
     with st.container(border=True):
-        st.subheader("⏱️ Live Guest Flow & Seating Stream")
+        st.subheader("Live Guest Flow & Seating Stream")
 
         if not res_df.empty:
             disp_res = res_df[[
-                "STATUS", "LOCATION_NAME", "GUEST_NAME", "PARTY_SIZE", "TABLE_NUMBER", 
+                "STATUS", "LOCATION_NAME", "GUEST_NAME", "PARTY_SIZE", "TABLE_NUMBER",
                 "SEATING_AREA", "VIP_TIER", "CURRENT_CHECK_TOTAL", "DIETARY_NOTES"
             ]].copy()
 
@@ -535,13 +612,13 @@ def render_capacity_and_stream(location_filter):
                 column_config={
                     "STATUS": st.column_config.TextColumn("Status"),
                     "LOCATION_NAME": "Location",
-                    "GUEST_NAME": "Guest Name",
-                    "PARTY_SIZE": st.column_config.NumberColumn("Party", format="%d guests"),
+                    "GUEST_NAME": "Guest",
+                    "PARTY_SIZE": st.column_config.NumberColumn("Party", format="%d"),
                     "TABLE_NUMBER": "Table",
                     "SEATING_AREA": "Section",
                     "VIP_TIER": "Tier",
-                    "CURRENT_CHECK_TOTAL": st.column_config.NumberColumn("Current Tab", format="$%.2f"),
-                    "DIETARY_NOTES": "Guest & Kitchen Notes"
+                    "CURRENT_CHECK_TOTAL": st.column_config.NumberColumn("Tab", format="$%.2f"),
+                    "DIETARY_NOTES": "Notes"
                 },
                 use_container_width=True,
                 hide_index=True
@@ -550,20 +627,11 @@ def render_capacity_and_stream(location_filter):
             st.info("No active reservations for selected filters.")
 
 # ----------------- Execution Layout -----------------
-# 1. Executive KPI Metrics Row
 render_kpi_row(selected_location)
-st.space("medium")
-
-# 2. AI Directives (instant from session state — never blocks)
 render_ai_section(selected_location)
-st.space("medium")
-
-# 3. Sales Analysis & YoY Performance Charts
+st.space("small")
 render_sales_section(selected_location)
-st.space("medium")
-
-# 4. Floor Capacity & Seating Live Streams
+st.space("small")
 render_capacity_and_stream(selected_location)
 
-# 5. Auto-refresh: JavaScript timer triggers a clean full-page rerun every 30s
 st_autorefresh(interval=30_000, limit=None, key="dashboard_autorefresh")
