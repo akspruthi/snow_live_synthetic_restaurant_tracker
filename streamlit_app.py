@@ -71,9 +71,6 @@ with st.container(border=True):
                         cur.execute("CALL RESTAURANT_STREAM_DEMO.PUBLIC.SP_GENERATE_OSTERIA_TELEMETRY()")
                     st.toast("Floor telemetry updated with live variance!", icon=":material/check_circle:")
                     st.cache_data.clear()
-                    # Invalidate session cache to trigger fresh AI
-                    if "ai_directives_cache" in st.session_state:
-                        del st.session_state["ai_directives_cache"]
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -85,43 +82,45 @@ with st.container(border=True):
 
 st.space("small")
 
-# ----------------- Helper: Fast Baseline AI Directives (Zero Latency) -----------------
-def get_rule_based_directives(location_name, occupancy_pct, upcoming_bookings, overstay_df, patio_open):
-    items = []
-    if not overstay_df.empty:
-        slow_tbl = overstay_df.iloc[0]
-        items.append({
-            "title": f"Table Turn Bottleneck: {slow_tbl['TABLE_NUMBER']}",
-            "severity": "CRITICAL" if slow_tbl['EST_DURATION_MINS'] >= 100 else "WARNING",
-            "category": "FLOOR",
-            "description": f"Table {slow_tbl['TABLE_NUMBER']} ({slow_tbl['GUEST_NAME']}, party of {slow_tbl['PARTY_SIZE']}) is at {slow_tbl['EST_DURATION_MINS']}m (+{slow_tbl['EST_DURATION_MINS']-65}m over turn). Tab: ${slow_tbl['CURRENT_CHECK_TOTAL']:.2f}.",
-            "action": "Dispatch floor manager with complimentary digestif/espresso to present check and free table for booked parties."
-        })
-    if not patio_open:
-        items.append({
-            "title": "Weather Alert: Patio Capacity Restricted",
-            "severity": "WARNING",
-            "category": "WEATHER",
-            "description": f"Outdoor patio seating closed due to local weather conditions (~25 seats unavailable).",
-            "action": "Re-assign outdoor waitlist parties to indoor high-tops and shift patio servers to express bar service."
-        })
-    if occupancy_pct >= 80:
-        items.append({
-            "title": f"High Rush Volume Pacing ({occupancy_pct:.1f}%)",
-            "severity": "WARNING",
-            "category": "FLOOR",
-            "description": f"Floor occupancy is at {occupancy_pct:.1f}% with {upcoming_bookings} upcoming bookings.",
-            "action": "Enforce strict 90-minute table pacing on walk-in parties of 4+ and hold bar counter strictly for waitlist."
-        })
-    elif len(items) < 2:
-        items.append({
-            "title": f"Capacity & Margin Opportunity ({occupancy_pct:.1f}%)",
-            "severity": "OPPORTUNITY",
-            "category": "SALES",
-            "description": f"Ample seating available across {location_name}. Walk-in queue is clear.",
-            "action": "Quote immediate seating for walk-ins and spotlight reserve Chianti Classico wine pairings to lift spend-per-cover."
-        })
-    return items
+# ----------------- Helper: Cortex AI Action Items Generator (Live LLM Call) -----------------
+@st.cache_data(ttl=30)
+def generate_ai_operational_directives(location_name, occupancy_pct, seated_count, total_capacity, weather_desc, patio_status, overstay_summary, upcoming_bookings):
+    prompt = f"""You are the AI General Manager for Osteria Bella (Contemporary Italian restaurant).
+Analyze this live floor telemetry snapshot:
+- Location: {location_name}
+- Floor Occupancy: {occupancy_pct:.1f}% ({seated_count} seated / {total_capacity} total seats)
+- Weather & Patio: {weather_desc} ({patio_status})
+- Upcoming Bookings / Waitlist: {upcoming_bookings} parties
+- Key Overstay Bottlenecks: {overstay_summary}
+
+Generate a JSON list of 2 to 3 concise, tactical operational action items for the floor manager or chef right now.
+Return ONLY valid JSON (no markdown ticks, no commentary) formatted as:
+[
+  {{
+    "title": "Short title",
+    "severity": "CRITICAL" or "WARNING" or "OPPORTUNITY" or "SUCCESS",
+    "category": "FLOOR" or "WEATHER" or "KITCHEN",
+    "description": "Specific context with numbers/parties",
+    "action": "Concrete directive for the manager"
+  }}
+]"""
+    try:
+        ai_df = conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', ?) AS AI_OUT", params=[prompt], ttl=30)
+        raw_text = str(ai_df["AI_OUT"].iloc[0]).strip()
+        if raw_text.startswith("```json"): raw_text = raw_text[7:]
+        if raw_text.startswith("```"): raw_text = raw_text[3:]
+        if raw_text.endswith("```"): raw_text = raw_text[:-3]
+        return json.loads(raw_text.strip())
+    except Exception as e:
+        return [
+            {
+                "title": f"Floor Pacing for {location_name}",
+                "severity": "WARNING" if occupancy_pct >= 80 else "OPPORTUNITY",
+                "category": "FLOOR",
+                "description": f"Occupancy at {occupancy_pct:.1f}% with {upcoming_bookings} upcoming bookings.",
+                "action": "Ensure table turns remain under 65 minutes and prep host stand for incoming reservations."
+            }
+        ]
 
 # ----------------- Section 1: Executive KPI Row & Live Floor Telemetry -----------------
 @st.fragment(run_every="30s")
@@ -191,8 +190,8 @@ def render_kpi_row(location_filter):
         st.metric("Bookings / Waitlist", f"{upcoming_res} / {waitlist_count}", border=True)
         st.metric("Weather & Patio", weather_text, patio_status, delta_color="normal" if "Open" in patio_status else "inverse", border=True)
 
-# ----------------- Section 2: Non-Blocking AI Directives & Action Items (Positioned at Top!) -----------------
-@st.fragment(run_every="60s")
+# ----------------- Section 2: Real-Time Cortex AI Directives (Independent Fragment) -----------------
+@st.fragment(run_every="45s")
 def render_ai_section(location_filter):
     cap_query = "SELECT * FROM RESTAURANT_STREAM_DEMO.PUBLIC.V_OSTERIA_CAPACITY"
     cap_df = conn.query(cap_query, ttl=10)
@@ -229,7 +228,6 @@ def render_ai_section(location_filter):
 
     weather_text = "68°F · Sunny"
     patio_status = "Open"
-    patio_open = True
     if not filtered_weather.empty:
         avg_temp = round(filtered_weather["TEMPERATURE_F"].mean(), 1)
         cond = filtered_weather["CONDITION"].iloc[0] if len(filtered_weather) == 1 else "Clear"
@@ -238,27 +236,25 @@ def render_ai_section(location_filter):
         weather_text = f"{avg_temp}°F · {cond}"
 
     overstay_df = res_df[(res_df["STATUS"] == "SEATED") & (res_df["EST_DURATION_MINS"] >= 85)] if not res_df.empty else pd.DataFrame()
+    overstay_summary = "None currently"
+    if not overstay_df.empty:
+        overstay_items = [f"Table {r['TABLE_NUMBER']} ({r['GUEST_NAME']}, party of {r['PARTY_SIZE']}) at {r['EST_DURATION_MINS']}m (tab ${r['CURRENT_CHECK_TOTAL']:.0f})" for _, r in overstay_df.head(2).iterrows()]
+        overstay_summary = "; ".join(overstay_items)
 
     with st.container(border=True):
         ai_head_col, ai_badge_col = st.columns([3, 1])
         with ai_head_col:
             st.subheader("🤖 Cortex AI Operator Directives & Action Items")
         with ai_badge_col:
-            st.caption(f"Evaluated: {datetime.now(PACIFIC_TZ).strftime('%I:%M %p PT')}")
+            st.caption(f"Evaluated: {datetime.now(PACIFIC_TZ).strftime('%I:%M:%S %p PT')}")
 
         col_actions, col_quick = st.columns([3, 2])
 
         with col_actions:
-            # Check session cache for instant zero-latency load
-            cache_key = f"ai_directives_{location_filter}"
-            
-            # 1. Use cached AI output or instant deterministic rules so the page NEVER freezes
-            if cache_key in st.session_state:
-                ai_directives = st.session_state[cache_key]
-            else:
-                ai_directives = get_rule_based_directives(location_filter, avg_occupancy, upcoming_res, overstay_df, patio_open)
-                # Store in session
-                st.session_state[cache_key] = ai_directives
+            # Live Cortex AI call with 30s TTL
+            ai_directives = generate_ai_operational_directives(
+                location_filter, avg_occupancy, seated_guests, total_seats, weather_text, patio_status, overstay_summary, upcoming_res
+            )
 
             color_map = {
                 "CRITICAL": ("#E53E3E", "#FC8181", "rgba(229,62,62,0.25)", "#FEB2B2", "🔴 Critical"),
@@ -559,18 +555,18 @@ def render_capacity_and_stream(location_filter):
         else:
             st.info("No active reservations for selected filters.")
 
-# ----------------- Instant Non-Blocking Render Flow -----------------
-# 1. Immediate Executive KPI Metrics Row (<50ms)
+# ----------------- Execution Layout -----------------
+# 1. Executive KPI Metrics Row
 render_kpi_row(selected_location)
 st.space("medium")
 
-# 2. AI Directives & Action Items (<10ms instant load using session state cache)
+# 2. Live Cortex AI Action Items & Directives
 render_ai_section(selected_location)
 st.space("medium")
 
-# 3. Sales Pacing & YoY Charts (<100ms)
+# 3. Sales Analysis & YoY Performance Charts
 render_sales_section(selected_location)
 st.space("medium")
 
-# 4. Floor Capacity Gauges & Live Stream (<100ms)
+# 4. Floor Capacity & Seating Live Streams
 render_capacity_and_stream(selected_location)
