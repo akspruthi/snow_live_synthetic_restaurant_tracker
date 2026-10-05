@@ -1,0 +1,12 @@
+# created-by: streamlit-in-workspaces; skill-version=1.0.0
+definition_version: 2
+entities:
+  - type: streamlit
+    name: restaurant_tracker
+    main_file: streamlit_app.py
+    artifacts:
+      - streamlit_app.py
+      - pyproject.toml
+      - .streamlit/config.toml
+      - setup_public_app_user.sql
+    query_warehouse: COMPUTE_WH
